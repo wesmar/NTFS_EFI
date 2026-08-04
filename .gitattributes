@@ -1,0 +1,17 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Force LF for shell scripts (must run in bash/Git Bash on Windows)
+*.sh text eol=lf
+
+# Keep CRLF for Windows-native files
+*.ps1 text eol=crlf
+*.vcxproj text eol=crlf
+*.vcxproj.filters text eol=crlf
+*.slnx text eol=crlf
+
+# Binaries
+*.lib binary
+*.efi binary
+*.zip binary
+*.7z binary

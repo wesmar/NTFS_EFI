@@ -1,0 +1,48 @@
+# Skrypty lokalne (nie publikować)
+git-push.sh
+pack-data.sh
+release-now.sh
+release-now.md
+release-update.sh
+struktura.txt
+
+# Pliki środowiskowe
+.env
+.env.*
+
+# Release files (assety idą na GitHub Releases, nie do repo)
+releases/
+data/
+*.zip
+*.7z
+*.tar.gz
+
+# Binarki i build (outputs)
+bin/
+obj/
+build/
+dist/
+*.exe
+*.efi
+
+# VS intermediate / user files
+.vs/
+*.user
+*.aps
+*.ncb
+*.sdf
+*.suo
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Tymczasowe pliki testowe (lokalne VM)
+*.vhd
+*.vhdx
+logs/
+
+# Katalogi z referencjami (zbyt ciężkie lub licencyjnie oddzielne)
+ms/
+ntfs-efi-ref/
+reactos/

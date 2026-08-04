@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="src/ntfs.vcxproj" Id="a1b2c3d4-e5f6-7890-abcd-ef1234567890" />
+  <Project Path="probe/ntfs_probe.vcxproj" Id="b2c3d4e5-f678-90ab-cdef-1234567890ab" />
+</Solution>

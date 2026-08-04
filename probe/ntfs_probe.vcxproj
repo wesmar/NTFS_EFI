@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{B2C3D4E5-F678-90AB-CDEF-1234567890AB}</ProjectGuid>
+    <ProjectName>ntfs_probe</ProjectName>
+    <RootNamespace>ntfs_probe</RootNamespace>
+    <TargetName>ntfs_probe</TargetName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <IncludePath>$(ProjectDir)..\src;$(ProjectDir)..\include\edk2;$(ProjectDir)..\include\edk2\X64;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\lib;$(LibraryPath)</LibraryPath>
+    <OutDir>$(ProjectDir)..\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\$(ProjectName)\$(Configuration)\</IntDir>
+    <TargetExt>.efi</TargetExt>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <StructMemberAlignment>Default</StructMemberAlignment>
+      <PreprocessorDefinitions>UEFI_BUILD;EFI_DEBUG;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <DisableSpecificWarnings>4100;4127;4152;4200;4201;4204;4214;4221;4244;4267;4459;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <AdditionalOptions>/Gs32768 /Brepro %(AdditionalOptions)</AdditionalOptions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <AdditionalDependencies>UefiApplicationEntryPoint.lib;UefiBootServicesTableLib.lib;UefiRuntimeServicesTableLib.lib;UefiLib.lib;UefiMemoryAllocationLib.lib;UefiMemoryLib.lib;BaseLib.lib;BasePrintLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>EFI Application</SubSystem>
+      <EntryPointSymbol>ProcessModuleEntryPointList</EntryPointSymbol>
+      <ProgramDatabaseFile>$(IntDir)$(TargetName).pdb</ProgramDatabaseFile>
+      <SectionAlignment>4096</SectionAlignment>
+      <RandomizedBaseAddress>false</RandomizedBaseAddress>
+      <DataExecutionPrevention>false</DataExecutionPrevention>
+      <MergeSections>.rdata=.data</MergeSections>
+      <AdditionalOptions>/OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <StructMemberAlignment>Default</StructMemberAlignment>
+      <PreprocessorDefinitions>UEFI_BUILD;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <DisableSpecificWarnings>4100;4127;4152;4200;4201;4204;4214;4221;4244;4267;4459;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <AdditionalOptions>/Gs32768 /Brepro %(AdditionalOptions)</AdditionalOptions>
+      <DebugInformationFormat>None</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <AdditionalDependencies>UefiApplicationEntryPoint.lib;UefiBootServicesTableLib.lib;UefiRuntimeServicesTableLib.lib;UefiLib.lib;UefiMemoryAllocationLib.lib;UefiMemoryLib.lib;BaseLib.lib;BasePrintLib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>EFI Application</SubSystem>
+      <EntryPointSymbol>ProcessModuleEntryPointList</EntryPointSymbol>
+      <SectionAlignment>4096</SectionAlignment>
+      <RandomizedBaseAddress>false</RandomizedBaseAddress>
+      <DataExecutionPrevention>false</DataExecutionPrevention>
+      <MergeSections>.rdata=.data</MergeSections>
+      <AdditionalOptions>/OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="ntfs_probe.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
