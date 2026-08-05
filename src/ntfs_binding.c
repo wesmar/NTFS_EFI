@@ -263,6 +263,12 @@ NtfsEfiBindingStop (
         return Status;
     }
 
+    /* Unmount while DiskIo/BlockIo are still valid.  The unmount path clears
+     * the $Volume dirty bit and performs the final FlushBlocks; doing this
+     * after CloseProtocol left the cleanup write dependent on an interface we
+     * had already released and Hyper-V consistently observed a dirty volume. */
+    NtfsEfiUnmountVolume (Vcb);
+
     gBS->CloseProtocol (
            ControllerHandle,
            &gEfiBlockIoProtocolGuid,
@@ -275,7 +281,5 @@ NtfsEfiBindingStop (
            This->DriverBindingHandle,
            ControllerHandle
            );
-
-    NtfsEfiUnmountVolume (Vcb);
     return EFI_SUCCESS;
 }

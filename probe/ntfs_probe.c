@@ -32,6 +32,14 @@ EFI_GUID gEfiFileInfoGuid = { 0x09576e92, 0x6d3f, 0x11d2,
 UINT32 _PCD_GET_MODE_32_PcdMaximumUnicodeStringLength = 1000000;
 UINT32 _PCD_GET_MODE_32_PcdMaximumAsciiStringLength   = 1000000;
 
+/* When gEspRoot is set (main opens the ESP FAT volume the probe booted from),
+ * every ProbePrint line is also appended to \_PROBE_TRACE.txt as ASCII - a full
+ * boot trace for Hyper-V, where ConOut is video-only with no capturable serial.
+ * Each line is open+append+CLOSE'd: firmware FAT only commits a file on Close,
+ * and the probe ends in a hard ResetSystem, so a kept-open handle would be lost. */
+static EFI_FILE_PROTOCOL *gEspRoot  = NULL;
+static UINT64             gTraceOff = 0;
+
 static VOID
 ProbePrint (
     IN CONST CHAR16 *Fmt,
@@ -46,6 +54,19 @@ ProbePrint (
     VA_END (Marker);
 
     gST->ConOut->OutputString (gST->ConOut, Buf);
+
+    if (gEspRoot != NULL) {
+        EFI_FILE_PROTOCOL *TF = NULL;
+        if (!EFI_ERROR (gEspRoot->Open (gEspRoot, &TF, L"\\_PROBE_TRACE.txt",
+                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+            CHAR8 A[512]; UINTN n = 0;
+            while (Buf[n] != 0 && n < sizeof (A) - 1) { A[n] = (CHAR8)Buf[n]; n++; }
+            TF->SetPosition (TF, gTraceOff);
+            TF->Write (TF, &n, A);
+            TF->Close (TF);        /* commit on FAT */
+            gTraceOff += n;
+        }
+    }
 }
 
 EFI_STATUS EFIAPI
@@ -86,6 +107,511 @@ DumpProgress (VOID)
         PF->Write (PF, &n, b);
         PF->Close (PF);
     }
+}
+
+/* ---- non-destructive fragmentation battery (real Windows volume) ----------
+ * Touches ONLY files/dirs it creates under \_EFITEST\ ; existing user data is
+ * never written. It checksums \Windows\System32\notepad.exe before AND after
+ * the workload to prove the write+delete traffic left real data byte-identical.
+ * Exercises the $Bitmap allocator + delete durability under deliberate
+ * fragmentation (interleaved multi-file writes, punch holes, refill holes). */
+#define FB_NFILES  16
+#define FB_FILESZ  (512u * 1024u)   /* 512 KiB each -> multi-cluster runs */
+#define FB_CHUNK   (64u * 1024u)
+
+static UINT8 FbByte (UINTN Idx, UINT64 Pos) { return (UINT8)(Idx * 31u + (UINT32)Pos); }
+
+/* Read an existing file fully; return its size + an additive 32-bit checksum. */
+static EFI_STATUS
+FbChecksum (
+    IN  EFI_FILE_PROTOCOL *Root,
+    IN  CONST CHAR16      *Path,
+    OUT UINT64            *OutSize,
+    OUT UINT32            *OutSum
+    )
+{
+    EFI_FILE_PROTOCOL *F = NULL;
+    VOID              *Buf;
+    UINT32             Sum = 0;
+    UINT64             Tot = 0;
+
+    *OutSize = 0; *OutSum = 0;
+    if (EFI_ERROR (Root->Open (Root, &F, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0)))
+        return EFI_NOT_FOUND;
+    if (EFI_ERROR (gBS->AllocatePool (EfiBootServicesData, FB_CHUNK, &Buf))) {
+        F->Close (F); return EFI_OUT_OF_RESOURCES;
+    }
+    for (;;) {
+        UINTN n = FB_CHUNK, i;
+        if (EFI_ERROR (F->Read (F, &n, Buf)) || n == 0) break;
+        for (i = 0; i < n; i++) Sum += ((UINT8 *)Buf)[i];
+        Tot += n;
+    }
+    gBS->FreePool (Buf);
+    F->Close (F);
+    *OutSize = Tot; *OutSum = Sum;
+    return EFI_SUCCESS;
+}
+
+/* Verify one file in Dir holds exactly Len bytes of pattern FbByte(Seed,pos). */
+static BOOLEAN
+FbVerify (
+    IN EFI_FILE_PROTOCOL *Dir,
+    IN CONST CHAR16      *Name,
+    IN UINTN              Seed,
+    IN UINT64             Len,
+    IN VOID              *Buf
+    )
+{
+    EFI_FILE_PROTOCOL *F = NULL;
+    UINT64             Pos = 0;
+    BOOLEAN            Ok = TRUE;
+
+    if (EFI_ERROR (Dir->Open (Dir, &F, (CHAR16 *)Name, EFI_FILE_MODE_READ, 0)))
+        return FALSE;
+    for (;;) {
+        UINTN n = FB_CHUNK, k;
+        if (EFI_ERROR (F->Read (F, &n, Buf)) || n == 0) break;
+        for (k = 0; k < n; k++) {
+            if (((UINT8 *)Buf)[k] != FbByte (Seed, Pos + k)) { Ok = FALSE; break; }
+        }
+        Pos += n;
+        if (!Ok) break;
+    }
+    F->Close (F);
+    return (Ok && Pos == Len);
+}
+
+/* Find an existing regular file to use as a read-only baseline: scan Root, then
+ * one level into the first real subdirectory. Writes "\...\name" into Out.
+ * Returns TRUE if one was found. */
+static BOOLEAN
+FbFindBaseline (
+    IN  EFI_FILE_PROTOCOL *Root,
+    OUT CHAR16            *Out,
+    IN  UINTN              OutChars
+    )
+{
+    UINT8  Ib[512];
+    UINTN  Is;
+    EFI_FILE_INFO *Fi = (EFI_FILE_INFO *)Ib;
+
+    Root->SetPosition (Root, 0);
+    for (;;) {
+        Is = sizeof (Ib);
+        if (EFI_ERROR (Root->Read (Root, &Is, Ib)) || Is == 0) break;
+        if (!(Fi->Attribute & EFI_FILE_DIRECTORY) && Fi->FileSize > 0) {
+            UnicodeSPrint (Out, OutChars * sizeof (CHAR16), L"\\%s", Fi->FileName);
+            return TRUE;
+        }
+    }
+    /* no regular file at root - descend into the first non-dotted subdir */
+    Root->SetPosition (Root, 0);
+    for (;;) {
+        EFI_FILE_PROTOCOL *Sub = NULL;
+        Is = sizeof (Ib);
+        if (EFI_ERROR (Root->Read (Root, &Is, Ib)) || Is == 0) break;
+        if ((Fi->Attribute & EFI_FILE_DIRECTORY) &&
+            Fi->FileName[0] != L'.' &&
+            Fi->FileName[0] != L'$' &&
+            !EFI_ERROR (Root->Open (Root, &Sub, Fi->FileName, EFI_FILE_MODE_READ, 0))) {
+            CHAR16 DirName[128];
+            UINTN  dn = 0;
+            while (Fi->FileName[dn] && dn < 127) { DirName[dn] = Fi->FileName[dn]; dn++; }
+            DirName[dn] = 0;
+            Sub->SetPosition (Sub, 0);
+            for (;;) {
+                UINT8  Jb[512]; UINTN Js = sizeof (Jb);
+                EFI_FILE_INFO *Ji = (EFI_FILE_INFO *)Jb;
+                if (EFI_ERROR (Sub->Read (Sub, &Js, Jb)) || Js == 0) break;
+                if (!(Ji->Attribute & EFI_FILE_DIRECTORY) && Ji->FileSize > 0) {
+                    UnicodeSPrint (Out, OutChars * sizeof (CHAR16), L"\\%s\\%s", DirName, Ji->FileName);
+                    Sub->Close (Sub);
+                    return TRUE;
+                }
+            }
+            Sub->Close (Sub);
+        }
+    }
+    return FALSE;
+}
+
+/*
+ * Recursively delete Name (file or whole directory tree) under Parent, exactly
+ * the way an application does it: enumerate, recurse into subdirectories,
+ * delete files, then remove the now-empty directory.
+ *
+ * The DRIVER deliberately never recurses - EFI_FILE_PROTOCOL.Delete on a
+ * non-empty directory is refused, same as the firmware's FAT driver - so
+ * "delete a folder with everything in it" is the caller's loop (this is what
+ * EC's FsDeleteRecursive does). This proves that pattern works end to end.
+ */
+/* EFI_WARN_DELETE_FAILURE ("handle closed, file NOT deleted") is a WARNING, so
+ * plain EFI_ERROR() is FALSE for it and a refused delete would read as success. */
+#define FB_DELETE_FAILED(St)  (EFI_ERROR (St) || (St) == EFI_WARN_DELETE_FAILURE)
+
+static EFI_STATUS
+FbDeleteTree (
+    IN     EFI_FILE_PROTOCOL *Parent,
+    IN     CONST CHAR16      *Name,
+    IN     UINTN              Depth,
+    IN OUT UINT32            *Files,
+    IN OUT UINT32            *Dirs,
+    IN OUT UINT32            *Fail
+    )
+{
+    EFI_FILE_PROTOCOL *Self = NULL;
+    EFI_STATUS         St;
+    UINT8              Ib[512];
+    UINTN              Is;
+    EFI_FILE_INFO     *Fi = (EFI_FILE_INFO *)Ib;
+    BOOLEAN            IsDir;
+
+    if (Depth > 16) { (*Fail)++; return EFI_UNSUPPORTED; }
+
+    St = Parent->Open (Parent, &Self, (CHAR16 *)Name,
+             EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+    if (EFI_ERROR (St)) { (*Fail)++; return St; }
+
+    {
+        EFI_GUID Fig = EFI_FILE_INFO_ID;
+        Is = sizeof (Ib);
+        if (EFI_ERROR (Self->GetInfo (Self, &Fig, &Is, Ib))) {
+            Self->Close (Self); (*Fail)++; return EFI_DEVICE_ERROR;
+        }
+        IsDir = (BOOLEAN)((Fi->Attribute & EFI_FILE_DIRECTORY) != 0);
+    }
+
+    if (!IsDir) {
+        St = Self->Delete (Self);          /* frees Self even on failure */
+        if (FB_DELETE_FAILED (St)) { (*Fail)++; return EFI_ACCESS_DENIED; }
+        (*Files)++;
+        return EFI_SUCCESS;
+    }
+
+    /* Directory: drain children first. Re-scan from the start after each
+     * removal - deleting an entry mutates the very index we are walking. */
+    for (;;) {
+        CHAR16  Child[260];
+        BOOLEAN Found = FALSE;
+
+        Self->SetPosition (Self, 0);
+        for (;;) {
+            Is = sizeof (Ib);
+            if (EFI_ERROR (Self->Read (Self, &Is, Ib)) || Is == 0) break;
+            if (Fi->FileName[0] == L'.' &&
+                (Fi->FileName[1] == 0 ||
+                 (Fi->FileName[1] == L'.' && Fi->FileName[2] == 0))) continue;
+            { UINTN k = 0;
+              while (Fi->FileName[k] != 0 && k < 259) { Child[k] = Fi->FileName[k]; k++; }
+              Child[k] = 0; }
+            Found = TRUE;
+            break;
+        }
+        if (!Found) break;
+        if (EFI_ERROR (FbDeleteTree (Self, Child, Depth + 1, Files, Dirs, Fail))) break;
+    }
+
+    St = Self->Delete (Self);              /* frees Self even on failure */
+    if (FB_DELETE_FAILED (St)) { (*Fail)++; return EFI_ACCESS_DENIED; }
+    (*Dirs)++;
+    return EFI_SUCCESS;
+}
+
+/* Run the whole battery on a mounted NTFS root, appending a human log to Log.
+ * Returns the log length. Only \_EFITEST\ and its children are ever created. */
+static UINTN
+FbRun (
+    IN EFI_FILE_PROTOCOL *Root,
+    OUT CHAR8            *Log,
+    IN UINTN              Cap
+    )
+{
+    UINTN              L = 0;
+    EFI_STATUS         St;
+    EFI_FILE_PROTOCOL *Dir = NULL;
+    EFI_FILE_PROTOCOL *H[FB_NFILES];
+    VOID              *Buf = NULL;
+    UINT64             RefSz = 0; UINT32 RefSum = 0;
+    UINT32             Chunks = FB_FILESZ / FB_CHUNK;
+    UINTN              i;
+    CHAR16             BasePath[288];
+    BOOLEAN            HaveBase;
+
+    for (i = 0; i < FB_NFILES; i++) H[i] = NULL;
+
+    /* Phase A: baseline checksum of a real, existing file (read-only) so we can
+     * prove the write/delete workload left real data byte-identical. Auto-found
+     * so this works on any NTFS volume (Windows C:, Recovery, a fresh test vol). */
+    HaveBase = FbFindBaseline (Root, BasePath, sizeof (BasePath) / sizeof (CHAR16));
+    if (!HaveBase) { UnicodeSPrint (BasePath, sizeof (BasePath), L"(none)"); }
+    St = HaveBase ? FbChecksum (Root, BasePath, &RefSz, &RefSum) : EFI_NOT_FOUND;
+    {
+        CHAR8 bp[300]; UINTN bi = 0;
+        while (BasePath[bi] && bi < 299) { bp[bi] = (CHAR8)BasePath[bi]; bi++; } bp[bi] = 0;
+        L += AsciiSPrint (Log + L, Cap - L, "A baseline '%a': st=%r size=%lu sum=%08x\n", bp, St, RefSz, RefSum);
+    }
+
+    if (EFI_ERROR (gBS->AllocatePool (EfiBootServicesData, FB_CHUNK, &Buf))) {
+        L += AsciiSPrint (Log + L, Cap - L, "FATAL: pool alloc failed\n");
+        return L;
+    }
+
+    /* Phase B: mkdir \_EFITEST, create 16 files, INTERLEAVE 64 KiB chunk writes
+     * across all open handles so the allocator hands out fragmented runs. */
+    St = Root->Open (Root, &Dir, L"\\_EFITEST",
+        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, EFI_FILE_DIRECTORY);
+    L += AsciiSPrint (Log + L, Cap - L, "B mkdir \\_EFITEST: %r\n", St);
+    if (EFI_ERROR (St)) { gBS->FreePool (Buf); return L; }
+
+    {
+        UINT32 Opened = 0;
+        for (i = 0; i < FB_NFILES; i++) {
+            CHAR16 Nm[32];
+            UnicodeSPrint (Nm, sizeof (Nm), L"f%02u.bin", (UINT32)i);
+            if (!EFI_ERROR (Dir->Open (Dir, &H[i], Nm,
+                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) Opened++;
+        }
+        L += AsciiSPrint (Log + L, Cap - L, "B opened %u/%u handles\n", Opened, (UINT32)FB_NFILES);
+    }
+    {
+        UINT64 Pos = 0; UINT32 c; EFI_STATUS WErr = EFI_SUCCESS;
+        for (c = 0; c < Chunks; c++) {
+            for (i = 0; i < FB_NFILES; i++) {
+                UINTN n = FB_CHUNK, k;
+                if (H[i] == NULL) continue;
+                for (k = 0; k < FB_CHUNK; k++) ((UINT8 *)Buf)[k] = FbByte (i, Pos + k);
+                if (EFI_ERROR (H[i]->Write (H[i], &n, Buf)) || n != FB_CHUNK) WErr = EFI_DEVICE_ERROR;
+            }
+            Pos += FB_CHUNK;
+        }
+        for (i = 0; i < FB_NFILES; i++) if (H[i]) H[i]->Flush (H[i]);
+        L += AsciiSPrint (Log + L, Cap - L,
+            "B interleaved write %u x %u KiB: %r\n", (UINT32)FB_NFILES, FB_FILESZ / 1024, WErr);
+    }
+    for (i = 0; i < FB_NFILES; i++) if (H[i]) { H[i]->Close (H[i]); H[i] = NULL; }
+
+    /* Phase C: reopen + verify every fragmented file byte-for-byte. */
+    {
+        UINT32 ok = 0, fail = 0;
+        for (i = 0; i < FB_NFILES; i++) {
+            CHAR16 Nm[32];
+            UnicodeSPrint (Nm, sizeof (Nm), L"f%02u.bin", (UINT32)i);
+            if (FbVerify (Dir, Nm, i, FB_FILESZ, Buf)) ok++; else fail++;
+        }
+        L += AsciiSPrint (Log + L, Cap - L, "C verify pass1: ok=%u fail=%u\n", ok, fail);
+    }
+
+    /* Phase D: delete even files to punch holes, then create 8 new files that
+     * must reuse the freed (scattered) clusters -> heavier fragmentation. */
+    {
+        UINT32 del = 0, dfail = 0;
+        for (i = 0; i < FB_NFILES; i += 2) {
+            CHAR16 Nm[32]; EFI_FILE_PROTOCOL *F = NULL;
+            UnicodeSPrint (Nm, sizeof (Nm), L"f%02u.bin", (UINT32)i);
+            if (!EFI_ERROR (Dir->Open (Dir, &F, Nm, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+                if (!EFI_ERROR (F->Delete (F))) del++; else dfail++;   /* Delete frees F */
+            } else dfail++;
+        }
+        L += AsciiSPrint (Log + L, Cap - L, "D punched %u holes (fail=%u)\n", del, dfail);
+    }
+    {
+        EFI_FILE_PROTOCOL *G[8]; UINT32 Op = 0; UINT64 Pos = 0; UINT32 c; EFI_STATUS WErr = EFI_SUCCESS;
+        for (i = 0; i < 8; i++) G[i] = NULL;
+        for (i = 0; i < 8; i++) {
+            CHAR16 Nm[32]; UnicodeSPrint (Nm, sizeof (Nm), L"g%02u.bin", (UINT32)i);
+            if (!EFI_ERROR (Dir->Open (Dir, &G[i], Nm,
+                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) Op++;
+        }
+        for (c = 0; c < Chunks; c++) {
+            for (i = 0; i < 8; i++) {
+                UINTN n = FB_CHUNK, k;
+                if (G[i] == NULL) continue;
+                for (k = 0; k < FB_CHUNK; k++) ((UINT8 *)Buf)[k] = FbByte (i + 100, Pos + k);
+                if (EFI_ERROR (G[i]->Write (G[i], &n, Buf)) || n != FB_CHUNK) WErr = EFI_DEVICE_ERROR;
+            }
+            Pos += FB_CHUNK;
+        }
+        for (i = 0; i < 8; i++) if (G[i]) { G[i]->Flush (G[i]); G[i]->Close (G[i]); }
+        L += AsciiSPrint (Log + L, Cap - L, "D refilled %u holes: %r\n", Op, WErr);
+
+        {
+            UINT32 ok = 0, fail = 0;
+            for (i = 0; i < 8; i++) {
+                CHAR16 Nm[32]; UnicodeSPrint (Nm, sizeof (Nm), L"g%02u.bin", (UINT32)i);
+                if (FbVerify (Dir, Nm, i + 100, FB_FILESZ, Buf)) ok++; else fail++;
+            }
+            L += AsciiSPrint (Log + L, Cap - L, "D verify holes: ok=%u fail=%u\n", ok, fail);
+        }
+    }
+
+    /* Phase E: delete EVERYTHING we made (odd f-files + all g-files), rmdir. */
+    {
+        UINT32 del = 0, dfail = 0;
+        for (i = 1; i < FB_NFILES; i += 2) {
+            CHAR16 Nm[32]; EFI_FILE_PROTOCOL *F = NULL;
+            UnicodeSPrint (Nm, sizeof (Nm), L"f%02u.bin", (UINT32)i);
+            if (!EFI_ERROR (Dir->Open (Dir, &F, Nm, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+                if (!EFI_ERROR (F->Delete (F))) del++; else dfail++;
+            } else dfail++;
+        }
+        for (i = 0; i < 8; i++) {
+            CHAR16 Nm[32]; EFI_FILE_PROTOCOL *F = NULL;
+            UnicodeSPrint (Nm, sizeof (Nm), L"g%02u.bin", (UINT32)i);
+            if (!EFI_ERROR (Dir->Open (Dir, &F, Nm, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+                if (!EFI_ERROR (F->Delete (F))) del++; else dfail++;
+            } else dfail++;
+        }
+        St = Dir->Delete (Dir);   /* rmdir empty dir; frees Dir */
+        Dir = NULL;
+        L += AsciiSPrint (Log + L, Cap - L,
+            "E deleted %u files (fail=%u), rmdir \\_EFITEST: %r\n", del, dfail, St);
+    }
+    {
+        EFI_FILE_PROTOCOL *F = NULL;
+        EFI_STATUS g = Root->Open (Root, &F, L"\\_EFITEST", EFI_FILE_MODE_READ, 0);
+        if (!EFI_ERROR (g)) { F->Close (F);
+            L += AsciiSPrint (Log + L, Cap - L, "E \\_EFITEST STILL PRESENT (BAD)\n"); }
+        else
+            L += AsciiSPrint (Log + L, Cap - L, "E \\_EFITEST gone: %r (good)\n", g);
+    }
+
+    /* Phase G: ROOT-directory stress with LONG names. The root of a grown volume
+     * is exactly the directory that keeps its $I30 index in an $ATTRIBUTE_LIST
+     * extension record, so this drives B+tree leaf splits, root push-down,
+     * separator promotion and $BITMAP:$I30 growth INSIDE that extension record -
+     * the paths a single mkdir never reaches. Everything created here is removed
+     * again; names are prefixed _EFITG_ so nothing else can collide. */
+    {
+        UINT32 mk = 0, mkfail = 0, seen = 0, del = 0, dfail = 0;
+        UINTN  gi;
+        EFI_STATUS LastFail = EFI_SUCCESS;
+
+        for (gi = 0; gi < 48; gi++) {
+            CHAR16 Nm[128]; EFI_FILE_PROTOCOL *F = NULL;
+            UnicodeSPrint (Nm, sizeof (Nm),
+                L"\\_EFITG_%02u_this_is_a_deliberately_long_entry_name_to_force_splits.tmp",
+                (UINT32)gi);
+            St = Root->Open (Root, &F, Nm,
+                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+            if (!EFI_ERROR (St)) {
+                UINTN n = 64;
+                SetMem (Buf, 64, (UINT8)gi);
+                F->Write (F, &n, Buf);
+                F->Close (F);
+                mk++;
+            } else { mkfail++; LastFail = St; }
+        }
+        L += AsciiSPrint (Log + L, Cap - L,
+            "G root-stress create: ok=%u fail=%u last=%r\n", mk, mkfail, LastFail);
+
+        /* every one must be findable again (proves the index stayed consistent) */
+        for (gi = 0; gi < 48; gi++) {
+            CHAR16 Nm[128]; EFI_FILE_PROTOCOL *F = NULL;
+            UnicodeSPrint (Nm, sizeof (Nm),
+                L"\\_EFITG_%02u_this_is_a_deliberately_long_entry_name_to_force_splits.tmp",
+                (UINT32)gi);
+            if (!EFI_ERROR (Root->Open (Root, &F, Nm, EFI_FILE_MODE_READ, 0))) { seen++; F->Close (F); }
+        }
+        L += AsciiSPrint (Log + L, Cap - L, "G root-stress reopen: found=%u/%u\n", seen, 48u);
+
+        for (gi = 0; gi < 48; gi++) {
+            CHAR16 Nm[128]; EFI_FILE_PROTOCOL *F = NULL;
+            UnicodeSPrint (Nm, sizeof (Nm),
+                L"\\_EFITG_%02u_this_is_a_deliberately_long_entry_name_to_force_splits.tmp",
+                (UINT32)gi);
+            if (!EFI_ERROR (Root->Open (Root, &F, Nm, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+                St = F->Delete (F);            /* frees F */
+                if (!EFI_ERROR (St)) del++; else { dfail++; LastFail = St; }
+            } else dfail++;
+        }
+        L += AsciiSPrint (Log + L, Cap - L,
+            "G root-stress delete: ok=%u fail=%u last=%r\n", del, dfail, LastFail);
+    }
+
+    /* Phase H: delete a whole NESTED tree in one go, the way a file manager does
+     * (EC's FsDeleteRecursive). Builds \_EFITH with files, a subdirectory and a
+     * sub-subdirectory, then removes the top entry recursively and checks that
+     * nothing is left behind. */
+    {
+        EFI_FILE_PROTOCOL *D1 = NULL, *D2 = NULL, *D3 = NULL;
+        UINT32 nf = 0, nd = 0, nfail = 0, made = 0;
+        UINTN  k;
+
+        St = Root->Open (Root, &D1, L"\\_EFITH",
+                 EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, EFI_FILE_DIRECTORY);
+        if (!EFI_ERROR (St)) {
+            St = D1->Open (D1, &D2, L"sub",
+                     EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, EFI_FILE_DIRECTORY);
+        }
+        if (!EFI_ERROR (St) && D2 != NULL) {
+            St = D2->Open (D2, &D3, L"deeper",
+                     EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, EFI_FILE_DIRECTORY);
+        }
+        if (!EFI_ERROR (St) && D3 != NULL) {
+            EFI_FILE_PROTOCOL *Lv[3]; UINTN li;
+            Lv[0] = D1; Lv[1] = D2; Lv[2] = D3;
+            for (li = 0; li < 3; li++) {
+                for (k = 0; k < 3; k++) {
+                    CHAR16 Nm[64]; EFI_FILE_PROTOCOL *F = NULL; UINTN n = 128;
+                    UnicodeSPrint (Nm, sizeof (Nm), L"tree_%u_%u.dat", (UINT32)li, (UINT32)k);
+                    if (!EFI_ERROR (Lv[li]->Open (Lv[li], &F, Nm,
+                            EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+                        SetMem (Buf, 128, (UINT8)(li * 16 + k));
+                        F->Write (F, &n, Buf);
+                        F->Close (F);
+                        made++;
+                    }
+                }
+            }
+        }
+        if (D3 != NULL) D3->Close (D3);
+        if (D2 != NULL) D2->Close (D2);
+        if (D1 != NULL) D1->Close (D1);
+
+        L += AsciiSPrint (Log + L, Cap - L,
+            "H tree built: st=%r dirs=3 files=%u\n", St, made);
+
+        /* the driver alone must REFUSE to remove the non-empty top directory -
+         * that refusal is what makes the recursive loop necessary */
+        {
+            EFI_FILE_PROTOCOL *T = NULL;
+            EFI_STATUS Direct = EFI_NOT_FOUND;
+            if (!EFI_ERROR (Root->Open (Root, &T, L"\\_EFITH",
+                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+                Direct = T->Delete (T);    /* frees T */
+            }
+            L += AsciiSPrint (Log + L, Cap - L,
+                "H direct rmdir of NON-empty tree: %r %a\n", Direct,
+                FB_DELETE_FAILED (Direct) ? "(correctly refused)" : "(BAD - should refuse)");
+        }
+
+        St = FbDeleteTree (Root, L"_EFITH", 0, &nf, &nd, &nfail);
+        L += AsciiSPrint (Log + L, Cap - L,
+            "H recursive delete: st=%r files=%u dirs=%u fail=%u\n", St, nf, nd, nfail);
+        {
+            EFI_FILE_PROTOCOL *T = NULL;
+            EFI_STATUS g = Root->Open (Root, &T, L"\\_EFITH", EFI_FILE_MODE_READ, 0);
+            if (!EFI_ERROR (g)) { T->Close (T);
+                L += AsciiSPrint (Log + L, Cap - L, "H \\_EFITH STILL PRESENT (BAD)\n"); }
+            else
+                L += AsciiSPrint (Log + L, Cap - L, "H \\_EFITH gone: %r (good)\n", g);
+        }
+    }
+
+    /* Phase F: re-checksum the same baseline file; must match Phase A exactly. */
+    if (HaveBase) {
+        UINT64 Sz2 = 0; UINT32 Sum2 = 0;
+        St = FbChecksum (Root, BasePath, &Sz2, &Sum2);
+        L += AsciiSPrint (Log + L, Cap - L,
+            "F recheck baseline: st=%r size=%lu sum=%08x %a\n",
+            St, Sz2, Sum2, (Sz2 == RefSz && Sum2 == RefSum) ? "UNCHANGED-OK" : "CHANGED-BAD");
+    } else {
+        L += AsciiSPrint (Log + L, Cap - L, "F recheck: no baseline file on this volume (skipped)\n");
+    }
+
+    gBS->FreePool (Buf);
+    return L;
 }
 
 /*
@@ -207,6 +733,83 @@ CopyTree (
     }
     gBS->FreePool (InfoBuf);
     return RetSt;
+}
+
+/* Delete every FILE in DirPath one at a time, reopening the directory each pass
+ * so enumeration reflects the (rebalanced) tree. Stops at the first file whose
+ * delete does not return a clean EFI_SUCCESS and records it. A real-volume test
+ * - makes no synthetic-layout assumptions. */
+static VOID
+ProbeDrainDir (
+    IN  EFI_FILE_PROTOCOL *WRoot,
+    IN  CONST CHAR16      *DirPath,
+    OUT UINT32            *Deleted,
+    OUT EFI_STATUS        *FailSt,
+    OUT CHAR16            *FailName,   /* >= 260 */
+    OUT UINT32            *Remaining
+    )
+{
+    VOID  *Ib = NULL;
+    UINT32 iter;
+
+    *Deleted = 0; *FailSt = EFI_SUCCESS; FailName[0] = 0; *Remaining = 0;
+    if (EFI_ERROR (gBS->AllocatePool (EfiBootServicesData, 2048, &Ib)) || Ib == NULL) {
+        *FailSt = EFI_OUT_OF_RESOURCES; return;
+    }
+
+    for (iter = 0; iter < 5000; iter++) {
+        EFI_FILE_PROTOCOL *Dir = NULL, *Child = NULL;
+        EFI_FILE_INFO     *Fi  = (EFI_FILE_INFO *)Ib;
+        CHAR16             Name[260];
+        BOOLEAN            Found = FALSE;
+        UINTN              Isz;
+
+        if (EFI_ERROR (WRoot->Open (WRoot, &Dir, (CHAR16 *)DirPath,
+                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) break;
+        Dir->SetPosition (Dir, 0);
+        for (;;) {
+            Isz = 2048;
+            if (EFI_ERROR (Dir->Read (Dir, &Isz, Ib)) || Isz == 0) break;
+            if (Fi->FileName[0] == L'.' &&
+                (Fi->FileName[1] == 0 || (Fi->FileName[1] == L'.' && Fi->FileName[2] == 0))) continue;
+            if (Fi->Attribute & EFI_FILE_DIRECTORY) continue;   /* files only */
+            { UINTN c = 0; while (Fi->FileName[c] && c < 259) { Name[c] = Fi->FileName[c]; c++; } Name[c] = 0; }
+            Found = TRUE; break;
+        }
+        if (!Found) { Dir->Close (Dir); break; }
+
+        if (!EFI_ERROR (Dir->Open (Dir, &Child, Name, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+            EFI_STATUS d = Child->Delete (Child);
+            if (d != EFI_SUCCESS) {
+                UINTN c = 0; while (Name[c] && c < 259) { FailName[c] = Name[c]; c++; } FailName[c] = 0;
+                *FailSt = d; Dir->Close (Dir); break;
+            }
+            (*Deleted)++;
+        } else {
+            UINTN c = 0; while (Name[c] && c < 259) { FailName[c] = Name[c]; c++; } FailName[c] = 0;
+            *FailSt = EFI_NOT_FOUND; Dir->Close (Dir); break;   /* open-by-name failed */
+        }
+        Dir->Close (Dir);
+    }
+
+    {
+        EFI_FILE_PROTOCOL *Dir = NULL;
+        EFI_FILE_INFO     *Fi  = (EFI_FILE_INFO *)Ib;
+        UINTN              Isz;
+        if (!EFI_ERROR (WRoot->Open (WRoot, &Dir, (CHAR16 *)DirPath, EFI_FILE_MODE_READ, 0))) {
+            Dir->SetPosition (Dir, 0);
+            for (;;) {
+                Isz = 2048;
+                if (EFI_ERROR (Dir->Read (Dir, &Isz, Ib)) || Isz == 0) break;
+                if (Fi->FileName[0] == L'.' &&
+                    (Fi->FileName[1] == 0 || (Fi->FileName[1] == L'.' && Fi->FileName[2] == 0))) continue;
+                if (Fi->Attribute & EFI_FILE_DIRECTORY) continue;
+                (*Remaining)++;
+            }
+            Dir->Close (Dir);
+        }
+    }
+    gBS->FreePool (Ib);
 }
 
 VOID EFIAPI
@@ -355,11 +958,27 @@ UefiMain (
     gST          = SystemTable;
     gBS          = SystemTable->BootServices;
 
-    ProbePrint (L"==NTFS-PROBE-START==\r\n");
-
     Status = gBS->OpenProtocol (ImageHandle, &LoadedImageGuid,
                     (VOID **)&LoadedImage, ImageHandle, NULL,
                     EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+
+    /* keep the ESP FAT root open so ProbePrint can persist a trace, and drop an
+     * immediate _ALIVE.txt marker (create+write+close) to prove we booted and
+     * can write the boot FAT even if nothing else runs. */
+    if (!EFI_ERROR (Status)) {
+        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *EspSfs;
+        if (!EFI_ERROR (gBS->HandleProtocol (LoadedImage->DeviceHandle, &SfspGuid, (VOID **)&EspSfs)) &&
+            !EFI_ERROR (EspSfs->OpenVolume (EspSfs, &gEspRoot))) {
+            EFI_FILE_PROTOCOL *AF = NULL;
+            if (!EFI_ERROR (gEspRoot->Open (gEspRoot, &AF, L"\\_ALIVE.txt",
+                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+                UINTN an = 12; AF->Write (AF, &an, "probe alive\n"); AF->Close (AF);
+            }
+        }
+    }
+
+    ProbePrint (L"==NTFS-PROBE-START==\r\n");
+
     if (!EFI_ERROR (Status) && !NtfsAlreadyMounted (&SfspGuid)) {
         ProbePrint (L"  no NTFS mounted - self-loading ntfs.efi\r\n");
         SelfLoadDriver (ImageHandle, LoadedImage, &SfspGuid);
@@ -587,6 +1206,7 @@ UefiMain (
         UINTN               WHandleCount = 0;
 
         WStatus = gBS->LocateHandleBuffer (ByProtocol, &SfspGuid, NULL, &WHandleCount, &WHandles);
+        ProbePrint (L"  SFS handles after self-load: %r count=%d\r\n", WStatus, (UINT32)WHandleCount);
         if (!EFI_ERROR (WStatus)) {
             UINTN wh;
             for (wh = 0; wh < WHandleCount; wh++) {
@@ -594,10 +1214,76 @@ UefiMain (
                 EFI_FILE_PROTOCOL               *WRoot;
                 EFI_FILE_PROTOCOL               *WFile;
 
-                if (WHandles[wh] == LoadedImage->DeviceHandle) continue;
+                if (WHandles[wh] == LoadedImage->DeviceHandle) { ProbePrint (L"  vol[%d]: skip (self ESP)\r\n", (UINT32)wh); continue; }
                 if (EFI_ERROR (gBS->OpenProtocol (WHandles[wh], &SfspGuid, (VOID **)&WSfsp,
-                        ImageHandle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL))) continue;
-                if (EFI_ERROR (WSfsp->OpenVolume (WSfsp, &WRoot))) continue;
+                        ImageHandle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL))) { ProbePrint (L"  vol[%d]: no SFSP\r\n", (UINT32)wh); continue; }
+                if (EFI_ERROR (WSfsp->OpenVolume (WSfsp, &WRoot))) { ProbePrint (L"  vol[%d]: OpenVolume fail\r\n", (UINT32)wh); continue; }
+                {
+                    EFI_FILE_PROTOCOL *Wd = NULL;
+                    EFI_STATUS ws = WRoot->Open (WRoot, &Wd, L"\\Windows", EFI_FILE_MODE_READ, 0);
+                    ProbePrint (L"  vol[%d]: mounted, \\Windows=%r\r\n", (UINT32)wh, ws);
+                    if (Wd) Wd->Close (Wd);
+                }
+
+                /* --- REAL Windows volume test: if this NTFS volume is a Windows
+                 * install (\Windows present), run the NON-DESTRUCTIVE fragmentation
+                 * battery. It only ever creates/deletes \_EFITEST\ and never writes
+                 * real user data (it checksums a real file before+after to prove
+                 * it stayed byte-identical). Results -> \_EFITEST_RESULT.txt, then
+                 * power off. Bypasses the whole synthetic battery. */
+                {
+                    EFI_FILE_PROTOCOL *WinDir = NULL;
+                    BOOLEAN Qualifies = FALSE;
+                    if (!EFI_ERROR (WRoot->Open (WRoot, &WinDir, L"\\Windows", EFI_FILE_MODE_READ, 0))) {
+                        WinDir->Close (WinDir); Qualifies = TRUE;
+                    } else if (!EFI_ERROR (WRoot->Open (WRoot, &WinDir, L"\\Recovery", EFI_FILE_MODE_READ, 0))) {
+                        WinDir->Close (WinDir); Qualifies = TRUE;
+                    }
+                    if (Qualifies) {
+                        CHAR8  Log[4096];
+                        UINTN  LogLen;
+
+                        ProbePrint (L"==EFITEST-START== (non-destructive frag battery)\r\n");
+                        LogLen = FbRun (WRoot, Log, sizeof (Log));
+
+                        {
+                            EFI_FILE_PROTOCOL *RF = NULL;
+                            if (!EFI_ERROR (WRoot->Open (WRoot, &RF, L"\\_EFITEST_RESULT.txt",
+                                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+                                UINTN wl = LogLen; RF->SetPosition (RF, 0);
+                                RF->Write (RF, &wl, Log); RF->Flush (RF); RF->Close (RF);
+                            }
+                        }
+                        /* also drop the result on the ESP FAT so the host can read
+                         * it WITHOUT ever mounting the Windows child disk (which
+                         * shuffles host drive letters). */
+                        if (gEspRoot != NULL) {
+                            EFI_FILE_PROTOCOL *EF = NULL;
+                            if (!EFI_ERROR (gEspRoot->Open (gEspRoot, &EF, L"\\_EFITEST_RESULT.txt",
+                                    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+                                UINTN wl = LogLen; EF->SetPosition (EF, 0);
+                                EF->Write (EF, &wl, Log); EF->Close (EF);
+                            }
+                        }
+                        /* echo the log to serial too (QEMU / debug console) */
+                        {
+                            UINTN qi; CHAR16 wc[2]; wc[1] = 0;
+                            for (qi = 0; qi < LogLen; qi++) { wc[0] = (CHAR16)Log[qi];
+                                gST->ConOut->OutputString (gST->ConOut, wc); }
+                        }
+                        /* clean unmount of the volume we wrote to: drives
+                         * BindingStop -> NtfsEfiUnmountVolume, which clears the
+                         * $Volume dirty flag + does a final FlushBlocks. Proves
+                         * "no chkdsk prompt on next boot" for the written volume. */
+                        {
+                            EFI_STATUS Dc = gBS->DisconnectController (WHandles[wh], NULL, NULL);
+                            ProbePrint (L"  EFITEST clean-unmount (disconnect): %r\r\n", Dc);
+                        }
+                        ProbePrint (L"==EFITEST-DONE==\r\n");
+                        SystemTable->RuntimeServices->ResetSystem (EfiResetShutdown, EFI_SUCCESS, 0, NULL);
+                        return EFI_SUCCESS;
+                    }
+                }
 
                 /* --- real recursive copy: ESP \src (host-staged System32
                  * files) -> NTFS \copied, all writes through ntfs.efi --- */
@@ -1015,7 +1701,7 @@ UefiMain (
                             /* (d) delete from split directory: should succeed if leaf, or return EFI_UNSUPPORTED if separator, but never crash */
                             {
                                 EFI_FILE_PROTOCOL *SplitDir;
-                                St = WRoot->Open (WRoot, &SplitDir, L"\\copied\\many_split", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+                                St = WRoot->Open (WRoot, &SplitDir, L"\\aged_dir", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
                                 if (!EFI_ERROR (St)) {
                                     EFI_FILE_PROTOCOL *DelFile;
                                     St = SplitDir->Open (SplitDir, &DelFile, L"synth_entry_20_reasonably_long_filename.txt",
@@ -1039,6 +1725,98 @@ UefiMain (
                                     SplitDir->Close (SplitDir);
                                 } else {
                                     ProbePrint (L"    open-many-split-dir: %r\r\n", St);
+                                }
+                            }
+
+                            /* (d2) DRAIN a split directory to zero: the real
+                             * EC recursive-delete case. Repeatedly enumerate
+                             * the FIRST real child and delete it, reopening the
+                             * directory each pass so the enumeration reflects
+                             * the (rebalanced) tree - a separator key must be
+                             * removable now, not refused, or files leak. */
+                            {
+                                UINT32     Deleted = 0;
+                                EFI_STATUS LastDel = EFI_SUCCESS;
+                                UINT32     Remaining = 0;
+                                UINT32     Iter;
+                                VOID      *Ib = NULL;
+                                CHAR16     FailName[260]; FailName[0] = L'\0';
+
+                                if (!EFI_ERROR (gBS->AllocatePool (EfiBootServicesData, 2048, &Ib)) && Ib != NULL) {
+                                    for (Iter = 0; Iter < 500; Iter++) {
+                                        EFI_FILE_PROTOCOL *Dir = NULL, *Child = NULL;
+                                        EFI_FILE_INFO     *Fi = (EFI_FILE_INFO *)Ib;
+                                        CHAR16             Name[260];
+                                        BOOLEAN            Found = FALSE;
+                                        UINTN              Isz;
+
+                                        if (EFI_ERROR (WRoot->Open (WRoot, &Dir, L"\\aged_dir",
+                                                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) break;
+                                        Dir->SetPosition (Dir, 0);
+                                        for (;;) {
+                                            Isz = 2048;
+                                            if (EFI_ERROR (Dir->Read (Dir, &Isz, Ib)) || Isz == 0) break;
+                                            if (Fi->FileName[0] == L'.' &&
+                                                (Fi->FileName[1] == L'\0' ||
+                                                 (Fi->FileName[1] == L'.' && Fi->FileName[2] == L'\0'))) continue;
+                                            if (Fi->Attribute & EFI_FILE_DIRECTORY) continue;   /* files only; leave subdirs */
+                                            { UINTN c = 0; while (Fi->FileName[c] != L'\0' && c < 259) { Name[c] = Fi->FileName[c]; c++; } Name[c] = L'\0'; }
+                                            Found = TRUE;
+                                            break;
+                                        }
+                                        if (!Found) { Dir->Close (Dir); break; }   /* drained */
+
+                                        if (!EFI_ERROR (Dir->Open (Dir, &Child, Name,
+                                                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0))) {
+                                            LastDel = Child->Delete (Child);   /* frees Child */
+                                            /* EFI_WARN_DELETE_FAILURE is NOT an EFI_ERROR - stop on
+                                             * anything that isn't a clean success and record it. */
+                                            if (LastDel != EFI_SUCCESS) {
+                                                UINTN c = 0; while (Name[c] != L'\0' && c < 259) { FailName[c] = Name[c]; c++; } FailName[c] = L'\0';
+                                                Dir->Close (Dir); break;
+                                            }
+                                            Deleted++;
+                                        } else {
+                                            Dir->Close (Dir); break;
+                                        }
+                                        Dir->Close (Dir);
+                                    }
+
+                                    /* count survivors */
+                                    {
+                                        EFI_FILE_PROTOCOL *Dir = NULL;
+                                        EFI_FILE_INFO     *Fi = (EFI_FILE_INFO *)Ib;
+                                        UINTN              Isz;
+                                        if (!EFI_ERROR (WRoot->Open (WRoot, &Dir, L"\\aged_dir",
+                                                EFI_FILE_MODE_READ, 0))) {
+                                            Dir->SetPosition (Dir, 0);
+                                            for (;;) {
+                                                Isz = 2048;
+                                                if (EFI_ERROR (Dir->Read (Dir, &Isz, Ib)) || Isz == 0) break;
+                                                if (Fi->FileName[0] == L'.' &&
+                                                    (Fi->FileName[1] == L'\0' ||
+                                                     (Fi->FileName[1] == L'.' && Fi->FileName[2] == L'\0'))) continue;
+                                                Remaining++;
+                                            }
+                                            Dir->Close (Dir);
+                                        }
+                                    }
+                                    gBS->FreePool (Ib);
+                                }
+
+                                ProbePrint (L"    del-drain-split: deleted=%d remaining=%d lastdel=%r (expect remaining=0)\r\n",
+                                    Deleted, Remaining, LastDel);
+                                {
+                                    EFI_FILE_PROTOCOL *RF;
+                                    if (!EFI_ERROR (CsDir->Open (CsDir, &RF, L"_SEPTEST.txt",
+                                            EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+                                        CHAR8  Line[200];
+                                        UINTN  Ln = (UINTN)AsciiSPrint (Line, sizeof (Line),
+                                            "drain deleted=%d remaining=%d lastdel=%r fail='%s'\n",
+                                            Deleted, Remaining, LastDel, FailName);
+                                        RF->Write (RF, &Ln, Line);
+                                        RF->Close (RF);
+                                    }
                                 }
                             }
 
@@ -1249,6 +2027,59 @@ UefiMain (
                                     TF->Close (TF);
                                 }
 
+                                /* REPRO of the EC "92MB -> 256KB" bug: read a big
+                                 * file and copy it WITHIN THE SAME NTFS volume
+                                 * (source read + dest write on one Vcb), like EC
+                                 * does fs1:\xiaomi -> fs1:\aaa. First make a 1 MB
+                                 * source, then (a) full-read it, (b) copy it. */
+                                {
+                                    EFI_FILE_PROTOCOL *Src, *Dst;
+                                    UINTN i, Sz;
+                                    UINTN BlkSz = 256 * 1024;   /* EC copies in 256 KB chunks */
+                                    CHAR8 *Blk = NULL;
+                                    { VOID *bp=NULL; gBS->AllocatePool (EfiBootServicesData, BlkSz, &bp); Blk=(CHAR8*)bp; }
+                                    if (Blk) for (i = 0; i < BlkSz; i++) Blk[i] = (CHAR8)('A' + (i & 31));
+                                    if (Blk && !EFI_ERROR (CsDir->Open (CsDir, &Src, L"samefs_src.bin",
+                                            EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE, 0))) {
+                                        for (i = 0; i < 368; i++) { Sz = BlkSz; Src->Write (Src, &Sz, Blk); } /* ~92 MB like HyperSploit */
+                                        Src->Close (Src);
+                                    }
+                                    /* (a) FULL READ */
+                                    if (!EFI_ERROR (CsDir->Open (CsDir, &Src, L"samefs_src.bin", EFI_FILE_MODE_READ, 0))) {
+                                        UINT64 tot = 0; UINTN got;
+                                        for (;;) { got = BlkSz; if (EFI_ERROR (Src->Read (Src, &got, Blk)) || got == 0) break; tot += got; }
+                                        ProbePrint (L"    samefs-READ: bytes=%ld (expect 96468992)\r\n", tot);
+                                        Src->Close (Src);
+                                    }
+                                    /* (b) COPY within same volume */
+                                    if (!EFI_ERROR (CsDir->Open (CsDir, &Src, L"samefs_src.bin", EFI_FILE_MODE_READ, 0)) &&
+                                        !EFI_ERROR (CsDir->Open (CsDir, &Dst, L"samefs_dst.bin",
+                                            EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE, 0))) {
+                                        UINT64 cop = 0; UINTN got, put;
+                                        for (;;) {
+                                            got = BlkSz;
+                                            if (EFI_ERROR (Src->Read (Src, &got, Blk)) || got == 0) break;
+                                            put = got;
+                                            if (EFI_ERROR (Dst->Write (Dst, &put, Blk)) || put != got) { ProbePrint (L"    samefs-COPY write STOP at %ld got=%d put=%d\r\n", cop, (UINT32)got, (UINT32)put); break; }
+                                            cop += put;
+                                        }
+                                        ProbePrint (L"    samefs-COPY: bytes=%ld (expect 96468992)\r\n", cop);
+                                        Src->Close (Src); Dst->Close (Dst);
+                                        /* persist result to file (Hyper-V has no serial) */
+                                        {
+                                            EFI_FILE_PROTOCOL *RF;
+                                            if (!EFI_ERROR (CsDir->Open (CsDir, &RF, L"_SAMEFS.txt",
+                                                    EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE, 0))) {
+                                                CHAR8 b[96]; UINTN n;
+                                                AsciiSPrint (b, sizeof (b), "copy=%lu (expect 96468992)\n", cop);
+                                                for (n=0; b[n]; n++) {}
+                                                RF->Write (RF, &n, b); RF->Close (RF);
+                                            }
+                                        }
+                                    }
+                                    if (Blk) gBS->FreePool (Blk);
+                                }
+
                                 /* grow a small resident file past a cluster:
                                  * forces resident->non-resident conversion + zero-fill,
                                  * original prefix must survive */
@@ -1328,5 +2159,7 @@ UefiMain (
     ProbePrint (L"==NTFS-PROBE-END==\r\n");
     if (Handles != NULL) gBS->FreePool (Handles);
 
+    /* power off so a Hyper-V harness (no serial) knows the battery finished */
+    SystemTable->RuntimeServices->ResetSystem (EfiResetShutdown, EFI_SUCCESS, 0, NULL);
     return EFI_SUCCESS;
 }

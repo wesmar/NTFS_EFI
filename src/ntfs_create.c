@@ -925,6 +925,92 @@ NtfsInsertIndexAllocationEntry (
         return EFI_UNSUPPORTED;
     }
 
+    /*
+     * Delete-all collapses a formerly large directory back to a resident
+     * INDEX_ROOT, but deliberately keeps its INDEX_ALLOCATION mapping and
+     * BITMAP attributes.  The clusters are still owned by that attribute;
+     * only the allocation bits and the root's child pointer are cleared.
+     *
+     * On the next create ResolveIndexHost therefore correctly reports that
+     * allocation attributes exist, while the resident root has no child to
+     * descend into.  Treat that state as a reusable empty large index: reset
+     * VCN 0 to an empty INDX block, restore bit 0 and grow the END entry back
+     * to END|NODE -> VCN 0.  Without this transition every create after
+     * "delete *" returned EFI_UNSUPPORTED until the directory was recreated.
+     */
+    {
+        PNTFS_ATTR_RECORD      RA = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+        PINDEX_ROOT_ATTRIBUTE Ir = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
+
+        if (!(Ir->Header.Flags & INDEX_ROOT_LARGE)) {
+            PINDEX_ENTRY_ATTRIBUTE End;
+            INT64                  Lcn0;
+            PUCHAR                 EmptyBlock;
+            PNTFS_ATTR_CTX         Probe;
+
+            End = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header + Ir->Header.FirstEntryOffset);
+            if (!(End->Flags & NTFS_INDEX_ENTRY_END) || End->Length != 16 ||
+                Ir->Header.TotalSizeOfEntries != Ir->Header.FirstEntryOffset + 16) {
+                Status = EFI_VOLUME_CORRUPTED;
+                goto Done;
+            }
+
+            Lcn0 = NtfsVcnToLcn (AllocCtx, 0);
+            if (Lcn0 < 0) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+
+            EmptyBlock = AllocatePool (Vcb->BytesPerIndexRecord);
+            if (EmptyBlock == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
+            NtfsInitIndexBlock (Vcb, EmptyBlock, 0);
+            Status = NtfsWriteIndexBlockAtLcn (Vcb, EmptyBlock, Lcn0);
+            FreePool (EmptyBlock);
+            if (EFI_ERROR (Status)) goto Done;
+
+            if (!NtfsEfiGrowResidentInRecord (Vcb, DirRec, RootOffset,
+                                               RA->Resident.ValueLength + 8)) {
+                Status = EFI_UNSUPPORTED;
+                goto Done;
+            }
+
+            /* The root growth shifted both following attributes. */
+            Probe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexAllocation,
+                                             L"$I30", 4, &AllocOffset);
+            if (Probe == NULL) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+            NtfsEfiFreeAttrCtx (Probe);
+            Probe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap,
+                                             L"$I30", 4, &BitmapOffset);
+            if (Probe == NULL) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+            NtfsEfiFreeAttrCtx (Probe);
+
+            RA  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+            Ir  = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
+            End = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header + Ir->Header.FirstEntryOffset);
+            ZeroMem (End, 24);
+            End->Length = 24;
+            End->Flags  = NTFS_INDEX_ENTRY_END | NTFS_INDEX_ENTRY_NODE;
+            NTFS_ENTRY_SUBVCN (End) = 0;
+            Ir->Header.Flags = INDEX_ROOT_LARGE;
+            Ir->Header.TotalSizeOfEntries = Ir->Header.FirstEntryOffset + 24;
+            Ir->Header.AllocatedSize      = Ir->Header.TotalSizeOfEntries;
+
+            {
+                PNTFS_ATTR_RECORD Bm = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + BitmapOffset);
+                if (Bm->IsNonResident || Bm->Resident.ValueLength == 0) {
+                    Status = EFI_UNSUPPORTED;
+                    goto Done;
+                }
+                *((PUCHAR)Bm + Bm->Resident.ValueOffset) |= 1;
+            }
+
+            Status = NtfsEfiWriteFileRecord (Vcb, DirRecMFT, DirRec);
+            if (EFI_ERROR (Status)) goto Done;
+
+            NtfsEfiFreeAttrCtx (AllocCtx);
+            AllocCtx = NtfsEfiFindAttribute (Vcb, DirRec, AttributeIndexAllocation,
+                                             L"$I30", 4, NULL);
+            if (AllocCtx == NULL) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+        }
+    }
+
     NtfsBuildIndexEntry (NewEntry, ChildRef, ParentRef, NowNtfs, Name, NameLen,
         0, 0, IsDirectory ? NTFS_FILE_TYPE_DIRECTORY : NTFS_FILE_TYPE_ARCHIVE);
 

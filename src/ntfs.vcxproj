@@ -69,7 +69,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>false</DataExecutionPrevention>
       <MergeSections>.rdata=.data</MergeSections>
-      <AdditionalOptions>/OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Brepro /OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -85,7 +85,7 @@
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <StructMemberAlignment>Default</StructMemberAlignment>
-      <PreprocessorDefinitions>UEFI_BUILD;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>UEFI_BUILD;NDEBUG;ENABLE_DEBUG_LOG=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <DisableSpecificWarnings>4100;4127;4152;4200;4201;4204;4214;4221;4244;4267;4459;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <AdditionalOptions>/Gs32768 /Brepro %(AdditionalOptions)</AdditionalOptions>
@@ -100,7 +100,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>false</DataExecutionPrevention>
       <MergeSections>.rdata=.data</MergeSections>
-      <AdditionalOptions>/OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Brepro /OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -112,6 +112,7 @@
     <ClCompile Include="ntfs_runlist.c" />
     <ClCompile Include="ntfs_attr.c" />
     <ClCompile Include="ntfs_lznt1.c" />
+    <ClCompile Include="ntfs_wof.c" />
     <ClCompile Include="ntfs_bitmap.c" />
     <ClCompile Include="ntfs_create.c" />
     <ClCompile Include="ntfs_delete.c" />

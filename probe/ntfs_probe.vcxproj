@@ -69,7 +69,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>false</DataExecutionPrevention>
       <MergeSections>.rdata=.data</MergeSections>
-      <AdditionalOptions>/OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Brepro /OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -100,7 +100,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>false</DataExecutionPrevention>
       <MergeSections>.rdata=.data</MergeSections>
-      <AdditionalOptions>/OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Brepro /OPT:ICF=10 /IGNORE:4001 /IGNORE:4108 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>

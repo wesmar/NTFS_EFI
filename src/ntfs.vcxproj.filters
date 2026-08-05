@@ -43,6 +43,9 @@
     <ClCompile Include="ntfs_lznt1.c">
       <Filter>NTFS Core</Filter>
     </ClCompile>
+    <ClCompile Include="ntfs_wof.c">
+      <Filter>NTFS Core</Filter>
+    </ClCompile>
     <ClCompile Include="ntfs_mft.c">
       <Filter>NTFS Core</Filter>
     </ClCompile>

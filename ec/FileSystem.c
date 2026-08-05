@@ -171,7 +171,11 @@ static EFI_STATUS FsOpenParentAndChild(
     }
   }
 
-  return EFI_SUCCESS;
+  // Preserve the final component's Open() result. Returning EFI_SUCCESS with
+  // ChildFile == NULL made callers count failed creates/opens as successful,
+  // hiding the exact point where a large destination directory stopped
+  // accepting new entries.
+  return status;
 }
 
 VOID FsInit(VOID)
@@ -365,6 +369,18 @@ static BOOLEAN gCopyOverwriteAll = FALSE;
 static BOOLEAN gCopySkipAll = FALSE;
 static UINTN gCopyCountSuccess = 0;
 static UINTN gCopyCountFailed = 0;
+static EFI_STATUS gCopyFirstFailureStatus = EFI_SUCCESS;
+static CHAR16 gCopyFirstFailureName[128] = { 0 };
+static CONST CHAR16* FsGetFileName(IN CONST CHAR16* Path);
+
+static VOID FsRememberCopyFailure(IN CONST CHAR16* Path, IN EFI_STATUS Status) {
+  if (!EFI_ERROR(gCopyFirstFailureStatus) && EFI_ERROR(Status)) {
+    CONST CHAR16* name = FsGetFileName(Path);
+    StrnCpyS(gCopyFirstFailureName, ARRAY_SIZE(gCopyFirstFailureName), name,
+             ARRAY_SIZE(gCopyFirstFailureName) - 1);
+    gCopyFirstFailureStatus = Status;
+  }
+}
 
 static BOOLEAN CheckAbortKey(VOID) {
   EFI_INPUT_KEY key;
@@ -493,6 +509,7 @@ EFI_STATUS FsCopyFile(
   }
 
   UINT64 totalCopied = 0;
+  EFI_STATUS copyStatus = EFI_SUCCESS;
   if (ProgressCallback) {
     ProgressCallback(0, fileSize);
   }
@@ -501,19 +518,28 @@ EFI_STATUS FsCopyFile(
     // Check for user cancel via ESC key
     if (CheckAbortKey()) {
       gCopyAbortRequested = TRUE;
-      status = EFI_ABORTED;
+      copyStatus = EFI_ABORTED;
       break;
     }
 
     UINTN readSize = COPY_BUF_SIZE;
     status = srcFile->Read(srcFile, &readSize, buffer);
-    if (EFI_ERROR(status) || readSize == 0) {
+    if (EFI_ERROR(status)) {
+      copyStatus = status;
+      break;
+    }
+    if (readSize == 0) {
       break;
     }
 
     UINTN writeSize = readSize;
     status = dstFile->Write(dstFile, &writeSize, buffer);
     if (EFI_ERROR(status)) {
+      copyStatus = status;
+      break;
+    }
+    if (writeSize != readSize) {
+      copyStatus = EFI_DEVICE_ERROR;
       break;
     }
 
@@ -527,17 +553,28 @@ EFI_STATUS FsCopyFile(
   srcFile->Close(srcFile);
   srcParent->Close(srcParent);
 
-  // Flush and Close destination file
-  dstFile->Flush(dstFile);
+  // Flush and close the destination before trying to remove a partial file.
+  // Preserve the original read/write error: a cleanup failure must not hide
+  // the reason the copy failed.
+  status = dstFile->Flush(dstFile);
+  if (!EFI_ERROR(copyStatus) && EFI_ERROR(status)) {
+    copyStatus = status;
+  }
   dstFile->Close(dstFile);
   dstParent->Close(dstParent);
 
-  if (status == EFI_ABORTED) {
-    // Delete partially copied file on abort
+  // A failed source read used to leave the destination entry behind (usually
+  // as a misleading zero-byte file).  No partial copy is a valid result, so
+  // remove it for every failure, not only for an ESC abort.  Also treat an
+  // early clean EOF as corruption when GetInfo advertised more source bytes.
+  if (!EFI_ERROR(copyStatus) && totalCopied != fileSize) {
+    copyStatus = EFI_DEVICE_ERROR;
+  }
+  if (EFI_ERROR(copyStatus)) {
     FsDeleteFileOrDir(DstPath);
   }
 
-  return status;
+  return copyStatus;
 }
 
 static EFI_STATUS FsCopyRecursiveInternal(
@@ -549,6 +586,7 @@ static EFI_STATUS FsCopyRecursiveInternal(
 
   BOOLEAN isDir = FALSE;
   if (!FsFileExists(SrcPath, &isDir)) {
+    FsRememberCopyFailure(SrcPath, EFI_NOT_FOUND);
     gCopyCountFailed++;
     return EFI_NOT_FOUND;
   }
@@ -556,6 +594,7 @@ static EFI_STATUS FsCopyRecursiveInternal(
   if (!isDir) {
     EFI_STATUS status = FsCopyFile(SrcPath, DstPath, ProgressCallback);
     if (EFI_ERROR(status)) {
+      FsRememberCopyFailure(SrcPath, status);
       if (status != EFI_ABORTED) gCopyCountFailed++;
       return status;
     }
@@ -563,10 +602,18 @@ static EFI_STATUS FsCopyRecursiveInternal(
     return EFI_SUCCESS;
   }
 
-  // Create target directory
+  // Create target directory.  Continue only when it already exists as a
+  // directory; the old code ignored every create error and then returned the
+  // successful source-listing status, so a whole failed subtree was reported
+  // as copied and became unselected in the panel.
   EFI_STATUS status = FsCreateDir(DstPath);
-  if (EFI_ERROR(status) && status != EFI_ACCESS_DENIED) {
-    // Proceed if directory already exists
+  if (EFI_ERROR(status)) {
+    BOOLEAN dstIsDir = FALSE;
+    if (!(FsFileExists(DstPath, &dstIsDir) && dstIsDir)) {
+      FsRememberCopyFailure(DstPath, status);
+      gCopyCountFailed++;
+      return status;
+    }
   }
   gCopyCountSuccess++; // Directory itself processed
 
@@ -574,7 +621,14 @@ static EFI_STATUS FsCopyRecursiveInternal(
   FS_FILE_ITEM* files = NULL;
   UINTN count = 0;
   status = FsListDirectory(SrcPath, &files, &count);
-  if (!EFI_ERROR(status) && files != NULL) {
+  if (EFI_ERROR(status)) {
+    FsRememberCopyFailure(SrcPath, status);
+    gCopyCountFailed++;
+    return status;
+  }
+
+  EFI_STATUS overallStatus = EFI_SUCCESS;
+  if (files != NULL) {
     for (UINTN i = 0; i < count; i++) {
       if (StrCmp(files[i].Name, L".") == 0 || StrCmp(files[i].Name, L"..") == 0) {
         continue;
@@ -590,14 +644,17 @@ static EFI_STATUS FsCopyRecursiveInternal(
       
       EFI_STATUS subStatus = FsCopyRecursiveInternal(nextSrc, nextDst, ProgressCallback);
       if (subStatus == EFI_ABORTED) {
-        status = EFI_ABORTED;
+        overallStatus = EFI_ABORTED;
         break;
+      }
+      if (EFI_ERROR(subStatus) && !EFI_ERROR(overallStatus)) {
+        overallStatus = subStatus;
       }
     }
     FreePool(files);
   }
 
-  return status;
+  return overallStatus;
 }
 
 EFI_STATUS FsCopyRecursive(
@@ -610,14 +667,18 @@ EFI_STATUS FsCopyRecursive(
   gCopySkipAll = FALSE;
   gCopyCountSuccess = 0;
   gCopyCountFailed = 0;
+  gCopyFirstFailureStatus = EFI_SUCCESS;
+  gCopyFirstFailureName[0] = L'\0';
 
   EFI_STATUS status = FsCopyRecursiveInternal(SrcPath, DstPath, ProgressCallback);
 
   if (status == EFI_ABORTED && gEcConfig.ShowOperationSummary) {
     GuiDrawMsgBox(L"Copy Aborted", L"Copy operation was cancelled by user.");
   } else if (gCopyCountFailed > 0 && gEcConfig.ShowOperationSummary) {
-    CHAR16 msg[128];
-    UnicodeSPrint(msg, sizeof(msg), L"Copy finished. %d items copied, %d failed.", gCopyCountSuccess, gCopyCountFailed);
+    CHAR16 msg[256];
+    UnicodeSPrint(msg, sizeof(msg),
+      L"First failure: %s\nStatus: %r",
+      gCopyFirstFailureName, gCopyFirstFailureStatus);
     GuiDrawMsgBox(L"Copy Complete", msg);
   }
 

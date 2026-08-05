@@ -125,7 +125,7 @@ flowchart TB
         BIND["Driver binding<br/>NTFS boot-sector probe, mount, unmount"]
         HANDLE["Handle factory and path lookup<br/>ntfs_file.c"]
         BTREE["B+tree index engine<br/>ntfs_btree.c, ntfs_create.c, ntfs_delete.c"]
-        ATTR["Attribute engine<br/>ntfs_attr.c, ntfs_runlist.c, ntfs_lznt1.c"]
+        ATTR["Attribute engine<br/>ntfs_attr.c, ntfs_runlist.c, ntfs_lznt1.c, ntfs_wof.c"]
         ALLOC["Allocators<br/>ntfs_bitmap.c: $Bitmap, $MFT:$BITMAP"]
         MFT["MFT record I/O<br/>USA fixup, cache, $MFTMirr sync"]
     end
@@ -166,7 +166,8 @@ flowchart TB
 | Non-resident `$DATA` | Mapping pairs decoded once into a flat `NTFS_RUN_ENTRY` array (up to 2048 extents per attribute); multi-extent reads served from it |
 | Sparse runs | Detected from the run's own offset-size nibble (`OffBytes == 0`), not from an LCN delta sentinel — a real fragment starting one cluster before its predecessor used to be misread as a hole |
 | LZNT1-compressed `$DATA` | Full decompressor ported from the NT source (`RtlDecompressBufferLZNT1`); handles the "stored uncompressed" unit form and the compressed-run-plus-hole form |
-| WOF / EFS streams | Refused with `EFI_UNSUPPORTED` rather than returning zeros |
+| WOF-backed files | Reads `WofCompressedData` and decodes XPRESS4K, XPRESS8K and XPRESS16K chunks; unsupported providers and algorithms fail closed |
+| EFS streams | Refused with `EFI_UNSUPPORTED` rather than returning zeros |
 | Directory enumeration | In-order B+tree walk across `$INDEX_ROOT` and every `$INDEX_ALLOCATION` `INDX` block, cached per handle on first `Read()` |
 | Path lookup | Multi-level, `\` and `/` normalised, case-insensitive through the on-disk `$UpCase` table |
 | `$ATTRIBUTE_LIST` | Followed on read, so attributes relocated into extension records are still found |
@@ -414,7 +415,7 @@ One responsibility per file, no header outside `src/ntfs.h`, nothing pulled in f
 
 ```
 NTFS_EFI/
-├── src/                      # ntfs.efi — the driver: 18 translation units, one header
+├── src/                      # ntfs.efi — the driver: 19 translation units, one header
 │   ├── ntfs.h                # Every on-disk structure, VCB and handle types, all prototypes
 │   ├── ntfs_entry.c          # Module entry point, AutoGen-replacement plumbing
 │   ├── ntfs_binding.c        # EFI_DRIVER_BINDING_PROTOCOL: Supported/Start/Stop, NTFS OEM-ID probe
@@ -430,6 +431,7 @@ NTFS_EFI/
 │   ├── ntfs_setinfo.c        # SetInfo timestamps and attributes, rename, move, resize, prealloc trim
 │   ├── ntfs_file.c           # Handle factory, path lookup, all EFI_FILE_PROTOCOL methods, dir cache
 │   ├── ntfs_lznt1.c          # LZNT1 decompressor, ported from the NT source codec
+│   ├── ntfs_wof.c            # WOF reparse reader and XPRESS4K/8K/16K decompressor
 │   ├── ntfs_symlink.c        # $REPARSE_POINT symlink target resolver
 │   ├── ntfs_time.c           # NTFS 100 ns ticks to and from EFI_TIME
 │   ├── ntfs_globals.c        # GUIDs, PCD/HII stubs, debug print, performance counters
@@ -580,6 +582,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Real `System32` copy | ~3.9 MB of genuine Windows 11 binaries (`notepad.exe`, `cmd.exe`, `xcopy.exe`, core DLLs) | SHA256 byte-exact per file, `chkdsk /f` CLEAN, volume NOT dirty |
 | B+tree density | 1500 files in one directory — forces `INDX` leaf splits and separator promotion | `chkdsk` CLEAN |
 | Mixed mutation pass | Create, grow, rename, cross-directory move and delete in a single run | `chkdsk` CLEAN, volume NOT dirty |
+| Same-volume EC copy and directory refill, Hyper-V | 550 files from Windows 11 `System32\drivers`, including WOF files and hard links, copied to another directory on the same NTFS volume; destination then emptied with `delete *` and filled again | 550/550 SHA256 byte-exact after refill, 0 missing, 0 mismatches, 0 extras, `chkdsk /f` CLEAN, volume NOT dirty |
 | Large copy, Hyper-V | 7 GB of mixed data, FAT source to NTFS target, ~4 minutes | `bad=0`, `chkdsk` CLEAN, volume NOT dirty |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
@@ -591,7 +594,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Status | Cause | Driver behaviour |
 |---|---|---|
 | `EFI_SUCCESS` | Operation completed | Data and metadata written; flushed at unmount |
-| `EFI_UNSUPPORTED` | WOF-compressed or encrypted stream; write to a compressed attribute; separator-key replacement that would overflow its block | Refused with nothing modified |
+| `EFI_UNSUPPORTED` | Unknown WOF provider/algorithm or encrypted stream; write to a compressed attribute; separator-key replacement that would overflow its block | Refused with nothing modified |
 | `EFI_VOLUME_CORRUPTED` | Bad USA fixup, wrong record signature, malformed run list | Mount or operation rejected, fail-closed |
 | `EFI_OUT_OF_RESOURCES` | Pool allocation failed mid-operation | Allocated clusters and MFT records released first |
 | `EFI_WRITE_PROTECTED` | Read-only media or write-protected volume | Blocked at the protocol layer |
@@ -608,7 +611,7 @@ Stated plainly, because each one is a deliberate boundary rather than an oversig
 2. **Write path assumes a single base MFT record.** `$ATTRIBUTE_LIST` is followed on read, but the driver does not create extension records, so a file whose attributes would overflow its 1 KB record cannot be written.
 3. **Hard links.** Only files with `LinkCount == 1` are deleted; a name that shares its record with another directory entry is refused, so a record another name still points at is never freed.
 4. **No `$LogFile` journal.** Integrity rests on ordered writes, explicit rollback and the `$Volume` dirty flag. After an unclean shutdown Windows will offer to run `chkdsk` — the correct conservative outcome.
-5. **No compression on write.** LZNT1 is decompress-only; compressed attributes are read, never rewritten.
+5. **No compression on write.** LZNT1 and WOF/XPRESS are decompress-only; compressed attributes are read, never rewritten.
 6. **Separator-key deletion can still be refused.** Rebalancing handles the normal cases; the rare replacement key that would overflow the host block returns `EFI_UNSUPPORTED` rather than restructuring further.
 7. **2048 extents per attribute.** Enough for any realistic file given run merging, but a pathologically fragmented attribute is rejected instead of truncated.
 8. **Automated coverage is uneven.** Create, write, delete, rename, move, `SetInfo`, B+tree splits and the copy paths are covered by the harness. The LZNT1, symlink and 8.3 short-name read paths are implemented but not yet fixtured for every edge case.

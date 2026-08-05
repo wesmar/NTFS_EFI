@@ -118,6 +118,134 @@ NtfsEfiCreateHandle (
     return Handle;
 }
 
+/*
+ * A hard-linked file has one $FILE_NAME attribute per parent directory.  The
+ * generic handle factory above historically used the first one in the MFT
+ * record.  During directory enumeration that is not necessarily the link
+ * being enumerated (Windows system files commonly have links in WinSxS,
+ * DriverStore and System32).  Returning that unrelated name makes a file
+ * manager build a path which does not exist in the current directory; a later
+ * Open() then reports EFI_NOT_FOUND even though the index entry was valid.
+ *
+ * Select the non-DOS $FILE_NAME whose parent is the directory handle being
+ * read. Keep a DOS entry only as a fallback for unusual DOS-only links. Some
+ * Windows hard-link sets spill $FILE_NAME attributes into extension records,
+ * so the base record's $ATTRIBUTE_LIST must be followed as well.
+ */
+static VOID
+NtfsEfiSelectNameInRecord (
+    IN     PNTFS_EFI_VCB       Vcb,
+    IN     PFILE_RECORD_HEADER Rec,
+    IN     ULONGLONG           ParentMFT,
+    IN OUT PNTFS_EFI_FILE      Handle,
+    IN OUT UINTN              *BestRank
+    )
+{
+    PNTFS_ATTR_RECORD Attr;
+    PUCHAR            RecordEnd;
+
+    RecordEnd = (PUCHAR)Rec + min (Rec->BytesInUse, Vcb->BytesPerFileRecord);
+    Attr = (PNTFS_ATTR_RECORD)((PUCHAR)Rec + Rec->AttributeOffset);
+    while ((PUCHAR)Attr + sizeof (NTFS_ATTR_RECORD) <= RecordEnd &&
+           Attr->Type != (ULONG)AttributeEnd) {
+        PFILENAME_ATTRIBUTE Fn;
+        UINTN Rank;
+
+        if (Attr->Length < 24 || (PUCHAR)Attr + Attr->Length > RecordEnd) break;
+        if (Attr->Type != (ULONG)AttributeFileName || Attr->IsNonResident ||
+            Attr->Resident.ValueOffset > Attr->Length ||
+            Attr->Resident.ValueLength < 66 ||
+            (UINT64)Attr->Resident.ValueOffset + Attr->Resident.ValueLength > Attr->Length) {
+            Attr = (PNTFS_ATTR_RECORD)((PUCHAR)Attr + Attr->Length);
+            continue;
+        }
+
+        Fn = (PFILENAME_ATTRIBUTE)((PUCHAR)Attr + Attr->Resident.ValueOffset);
+        if ((Fn->DirectoryFileReferenceNumber & NTFS_MFT_MASK) != ParentMFT ||
+            Fn->NameLength == 0 || Fn->NameLength > 255 ||
+            66U + (UINTN)Fn->NameLength * sizeof (WCHAR) > Attr->Resident.ValueLength) {
+            Attr = (PNTFS_ATTR_RECORD)((PUCHAR)Attr + Attr->Length);
+            continue;
+        }
+
+        Rank = (Fn->NameType == NTFS_FILE_NAME_DOS) ? 1U : 2U;
+        if (Rank > *BestRank) {
+            Handle->FileNameChars = Fn->NameLength;
+            CopyMem (Handle->FileName, Fn->Name,
+                     Handle->FileNameChars * sizeof (WCHAR));
+            Handle->FileName[Handle->FileNameChars] = L'\0';
+            *BestRank = Rank;
+        }
+        Attr = (PNTFS_ATTR_RECORD)((PUCHAR)Attr + Attr->Length);
+    }
+}
+
+static VOID
+NtfsEfiSelectNameForParent (
+    IN     PNTFS_EFI_VCB  Vcb,
+    IN     ULONGLONG      MFTIndex,
+    IN     ULONGLONG      ParentMFT,
+    IN OUT PNTFS_EFI_FILE Handle
+    )
+{
+    PFILE_RECORD_HEADER Rec;
+    PNTFS_ATTR_CTX      ListCtx;
+    UINTN               BestRank = 0;
+
+    Rec = AllocatePool (Vcb->BytesPerFileRecord);
+    if (Rec == NULL) return;
+    if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, MFTIndex, Rec))) {
+        FreePool (Rec);
+        return;
+    }
+
+    NtfsEfiSelectNameInRecord (Vcb, Rec, ParentMFT, Handle, &BestRank);
+
+    if (BestRank < 2) {
+        ListCtx = NtfsEfiFindAttrInRecord (Vcb, Rec, AttributeAttributeList,
+                                           NULL, 0, NULL);
+        if (ListCtx != NULL) {
+            UINT64 ListLen = NtfsEfiAttrDataLength (ListCtx);
+            if (ListLen >= sizeof (NTFS_ATTR_LIST_ITEM) && ListLen <= 1024U * 1024U) {
+                PUCHAR ListBuf = AllocatePool ((UINTN)ListLen);
+                if (ListBuf != NULL &&
+                    NtfsEfiReadAttr (Vcb, ListCtx, 0, (PCHAR)ListBuf,
+                                     (ULONG)ListLen) == (ULONG)ListLen) {
+                    PNTFS_ATTR_LIST_ITEM Item = (PNTFS_ATTR_LIST_ITEM)ListBuf;
+                    PUCHAR ListEnd = ListBuf + ListLen;
+                    ULONGLONG LastRemote = (ULONGLONG)-1LL;
+
+                    while ((PUCHAR)Item + sizeof (NTFS_ATTR_LIST_ITEM) <= ListEnd &&
+                           Item->Type != (ULONG)AttributeEnd) {
+                        ULONGLONG RemoteMFT;
+                        if (Item->Length < sizeof (NTFS_ATTR_LIST_ITEM) ||
+                            (PUCHAR)Item + Item->Length > ListEnd) break;
+
+                        RemoteMFT = Item->MFTIndex & NTFS_MFT_MASK;
+                        if (Item->Type == (ULONG)AttributeFileName &&
+                            RemoteMFT != MFTIndex && RemoteMFT != LastRemote) {
+                            PFILE_RECORD_HEADER RemoteRec = AllocatePool (Vcb->BytesPerFileRecord);
+                            if (RemoteRec != NULL) {
+                                if (!EFI_ERROR (NtfsEfiReadFileRecord (Vcb, RemoteMFT, RemoteRec))) {
+                                    NtfsEfiSelectNameInRecord (Vcb, RemoteRec, ParentMFT,
+                                                               Handle, &BestRank);
+                                }
+                                FreePool (RemoteRec);
+                            }
+                            LastRemote = RemoteMFT;
+                            if (BestRank >= 2) break;
+                        }
+                        Item = (PNTFS_ATTR_LIST_ITEM)((PUCHAR)Item + Item->Length);
+                    }
+                }
+                if (ListBuf != NULL) FreePool (ListBuf);
+            }
+            NtfsEfiFreeAttrCtx (ListCtx);
+        }
+    }
+    FreePool (Rec);
+}
+
 /* =========================================================================
  * Path lookup
  * ========================================================================= */
@@ -427,8 +555,7 @@ NtfsEfiRead (
             FreePool (Rec); return EFI_DEVICE_ERROR;
         }
         DataCtx = NtfsEfiFindAttribute (Vcb, Rec, AttributeData, NULL, 0, NULL);
-        FreePool (Rec);
-        if (DataCtx == NULL) return EFI_NOT_FOUND;
+        if (DataCtx == NULL) { FreePool (Rec); return EFI_NOT_FOUND; }
 
         Print (L"[ntfs] Read: MFTIndex=%ld FileSize=%ld Position=%ld ToRead=%d IsNonResident=%d ValueLen/DataSize=%ld\n",
             F->MFTIndex, F->FileSize, F->Position, ToRead, DataCtx->pRecord->IsNonResident,
@@ -452,14 +579,22 @@ NtfsEfiRead (
          */
         if (DataCtx->pRecord->IsNonResident && DataCtx->pRecord->NonResident.CompressionUnit != 0) {
             if (DataCtx->RunCount == 1 && DataCtx->Runs[0].LBN == -1LL) {
+                EFI_STATUS WofStatus;
                 NtfsEfiFreeAttrCtx (DataCtx);
-                return EFI_UNSUPPORTED;
+                WofStatus = NtfsEfiReadWofAttr (Vcb, Rec, F->FileSize, F->Position,
+                                                (PCHAR)Buffer, ToRead, &Read);
+                FreePool (Rec);
+                if (EFI_ERROR (WofStatus)) return WofStatus;
+                F->Position += Read;
+                *BufferSize = Read;
+                return (Read == ToRead) ? EFI_SUCCESS : EFI_DEVICE_ERROR;
             }
             Read = NtfsEfiReadCompressedAttr (Vcb, DataCtx, F->Position, (PCHAR)Buffer, ToRead);
         } else {
             Read = NtfsEfiReadAttr (Vcb, DataCtx, F->Position, (PCHAR)Buffer, ToRead);
         }
         NtfsEfiFreeAttrCtx (DataCtx);
+        FreePool (Rec);
 
         F->Position += Read;
         *BufferSize  = Read;
@@ -488,6 +623,7 @@ NtfsEfiRead (
 
         Child = NtfsEfiCreateHandle (Vcb, ChildMFT);
         if (Child == NULL) return EFI_OUT_OF_RESOURCES;
+        NtfsEfiSelectNameForParent (Vcb, ChildMFT, F->MFTIndex, Child);
 
         InfoSize = SIZE_OF_EFI_FILE_INFO
                    + (Child->FileNameChars + 1) * sizeof (CHAR16);

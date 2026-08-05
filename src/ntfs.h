@@ -624,6 +624,18 @@ NtfsEfiReadCompressedAttr (
     IN  ULONG          Length
     );
 
+/* ntfs_wof.c - WOF file-provider XPRESS4K/8K/16K read support */
+EFI_STATUS
+NtfsEfiReadWofAttr (
+    IN  PNTFS_EFI_VCB       Vcb,
+    IN  PFILE_RECORD_HEADER Record,
+    IN  UINT64              FileSize,
+    IN  UINT64              Offset,
+    OUT PCHAR               Buffer,
+    IN  ULONG               Length,
+    OUT ULONG              *BytesRead
+    );
+
 /* ntfs_create.c */
 EFI_STATUS
 NtfsEfiCreateFile (

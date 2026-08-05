@@ -625,6 +625,7 @@ UefiMain (
                 }
               }
             }
+            FsFlushVolumeForPath(targetInput);
             if (anyCopied) {
               PanelRefreshKeep(&leftPanel, NULL, leftPanel.SelectedIndex);
               PanelRefreshKeep(&rightPanel, NULL, rightPanel.SelectedIndex);
@@ -651,6 +652,7 @@ UefiMain (
             StrCpyS(gCopyDst, MAX_PATH_LEN, targetPath);
 
             EFI_STATUS copyStatus = FsCopyRecursive(srcPath, targetPath, CopyCallback);
+            FsFlushVolumeForPath(targetPath);
             if (!EFI_ERROR(copyStatus) && gEcConfig.ShowSuccessMessages) {
               GuiDrawMsgBox(L"Success", L"Item copied successfully!");
             }

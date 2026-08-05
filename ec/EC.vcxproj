@@ -77,7 +77,7 @@
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <DebugInformationFormat>None</DebugInformationFormat>
       <ForceConformanceInForLoopScope />
-      <AdditionalOptions>/Gs32768 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Gs32768 /Brepro %(AdditionalOptions)</AdditionalOptions>
       <ErrorReporting />
       <FloatingPointModel />
     </ClCompile>
@@ -97,7 +97,7 @@
       <UACExecutionLevel />
       <UACUIAccess />
       <TypeLibraryResourceID />
-      <AdditionalOptions>/DEBUG:NONE /IGNORE:4001 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/DEBUG:NONE /Brepro /IGNORE:4001 /IGNORE:4254 /IGNORE:4281 %(AdditionalOptions)</AdditionalOptions>
       <LinkErrorReporting />
     </Link>
   </ItemDefinitionGroup>

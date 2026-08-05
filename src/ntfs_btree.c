@@ -440,12 +440,17 @@ NtfsCollectSub (PNTFS_EFI_VCB Vcb, PNTFS_ATTR_CTX Alloc, ULONG ClustPerBlock,
 {
     PUCHAR IndexBuf = AllocatePool (Vcb->BytesPerIndexRecord);
     PINDEX_BUFFER Block;
+    ULONG Read;
+    EFI_STATUS FixupStatus = EFI_NOT_READY;
     if (IndexBuf == NULL) return;
-    if (NtfsEfiReadAttr (Vcb, Alloc, VCN * Vcb->BytesPerCluster,
-            (PCHAR)IndexBuf, Vcb->BytesPerIndexRecord) == Vcb->BytesPerIndexRecord) {
+    Read = NtfsEfiReadAttr (Vcb, Alloc, VCN * Vcb->BytesPerCluster,
+            (PCHAR)IndexBuf, Vcb->BytesPerIndexRecord);
+    if (Read == Vcb->BytesPerIndexRecord) {
         Block = (PINDEX_BUFFER)IndexBuf;
-        if (Block->Ntfs.Type == NRH_INDX_TYPE &&
-            !EFI_ERROR (NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs))) {
+        if (Block->Ntfs.Type == NRH_INDX_TYPE) {
+            FixupStatus = NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs);
+        }
+        if (Block->Ntfs.Type == NRH_INDX_TYPE && !EFI_ERROR (FixupStatus)) {
             PINDEX_ENTRY_ATTRIBUTE F = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
             PINDEX_ENTRY_ATTRIBUTE L = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
             NtfsCollectBlock (Vcb, Alloc, ClustPerBlock, F, L, Out, Max, Count);
