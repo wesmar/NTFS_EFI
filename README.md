@@ -1,5 +1,7 @@
 <div align="center">
 
+![Chess Engine Screenshot](images/ec.gif)
+
 [![Latest Release](https://img.shields.io/github/v/release/wesmar/NTFS_EFI?label=Latest%20Release&style=for-the-badge)](https://github.com/wesmar/NTFS_EFI/releases/latest)
 
 **[⬇ Download NTFS_EFI.7z](https://github.com/wesmar/NTFS_EFI/releases/download/latest/NTFS_EFI.7z)**
