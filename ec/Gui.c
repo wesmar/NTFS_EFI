@@ -760,13 +760,30 @@ VOID GuiDrawCopyProgress(
   StrCpyS(srcName, 128, SrcPath);
   StrCpyS(dstName, 128, DstPath);
 
-  UINTN maxChars = GuiCharsForWidth(boxW - 100, cellW);
+  /*
+   * The path does not start at the left edge of the box - it starts after the
+   * 25 px inset AND the six cells of the "From:"/"To:  " label. The character
+   * budget therefore has to be measured from where the text actually begins to
+   * the inner right edge, not from the box width.
+   *
+   * "boxW - 100" ignored that offset: with the usual 700 px box and a 16 px
+   * cell (8x16 font at scale 2) it allowed 37 characters starting at +121 px,
+   * so the field ended 13 px PAST the right border. A path that filled the last
+   * column - any 7-character name ending in a letter, e.g.
+   * fs2:\Windows\System32\drivers\afd.sys - drew its final glyph outside the
+   * box. The per-frame erase is exactly the box rectangle, so those columns were
+   * never repainted and the glyph stayed on screen as a ghost over every later
+   * file, hanging past the yellow frame.
+   */
+  UINTN textX      = boxX + 25 + cellW * 6;
+  UINTN innerRight = boxX + boxW - 25;
+  UINTN maxChars   = (innerRight > textX) ? GuiCharsForWidth(innerRight - textX, cellW) : 0;
 
   UiGfxDrawAsciiAt(boxX + 25, boxY + 15 + cellH, "From:", COLOR_CYAN_R, COLOR_CYAN_G, COLOR_CYAN_B);
-  GuiDrawUnicodeClippedAt(boxX + 25 + cellW * 6, boxY + 15 + cellH, srcName, maxChars, COLOR_WHITE_R, COLOR_WHITE_G, COLOR_WHITE_B);
+  GuiDrawUnicodeClippedAt(textX, boxY + 15 + cellH, srcName, maxChars, COLOR_WHITE_R, COLOR_WHITE_G, COLOR_WHITE_B);
 
   UiGfxDrawAsciiAt(boxX + 25, boxY + 15 + cellH * 2, "To:  ", COLOR_CYAN_R, COLOR_CYAN_G, COLOR_CYAN_B);
-  GuiDrawUnicodeClippedAt(boxX + 25 + cellW * 6, boxY + 15 + cellH * 2, dstName, maxChars, COLOR_WHITE_R, COLOR_WHITE_G, COLOR_WHITE_B);
+  GuiDrawUnicodeClippedAt(textX, boxY + 15 + cellH * 2, dstName, maxChars, COLOR_WHITE_R, COLOR_WHITE_G, COLOR_WHITE_B);
 
   // Draw progress bar outline
   UINTN barX = boxX + 25;

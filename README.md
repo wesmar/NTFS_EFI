@@ -176,7 +176,7 @@ flowchart TB
 | Reparse points | `$REPARSE_POINT` symlink resolver for `\??\`, drive-letter and relative targets (MS-FSCC layout) |
 | Volume metadata | Label from `$Volume`, free clusters from `$Bitmap`, both returned via `EFI_FILE_SYSTEM_INFO` |
 
-Case folding uses the volume's own 65536-entry `$UpCase` table — the same table `chkdsk` and NTFS.sys collate with — so international names match exactly as Windows matches them, Polish `Ą Ć Ę Ł Ń Ó Ś Ź Ż` included. If `$UpCase` cannot be read the mount falls back to an ASCII identity table instead of dereferencing NULL.
+Case folding uses the volume's own 65536-entry `$UpCase` table — the same table `chkdsk` and NTFS.sys collate with — so international names match exactly as Windows matches them, Polish `Ą Ć Ę Ł Ń Ó Ś Ź Ż` included. If `$UpCase` cannot be read the mount falls back to an ASCII identity table instead of dereferencing NULL. Every insert and every lookup goes through that one table — including the resident-`$INDEX_ROOT` insert, which until recently folded only `a`-`z` by hand and could therefore file a Cyrillic or Greek name in the wrong slot.
 
 ---
 
@@ -585,6 +585,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Mixed mutation pass | Create, grow, rename, cross-directory move and delete in a single run | `chkdsk` CLEAN, volume NOT dirty |
 | Same-volume EC copy and directory refill, Hyper-V | 550 files from Windows 11 `System32\drivers`, including WOF files and hard links, copied to another directory on the same NTFS volume; destination then emptied with `delete *` and filled again | 550/550 SHA256 byte-exact after refill, 0 missing, 0 mismatches, 0 extras, `chkdsk /f` CLEAN, volume NOT dirty |
 | Large copy, Hyper-V | 7 GB of mixed data, FAT source to NTFS target, ~4 minutes | `bad=0`, `chkdsk` CLEAN, volume NOT dirty |
+| Collation beyond a-z, Hyper-V | Cyrillic capital Ya then small a created in a fresh (still resident-index) directory, then both reopened | `chkdsk` CLEAN — the same test against the previous build reports `Index $I30 ... is incorrectly sorted` |
 | Same-filesystem 92 MB copy, Hyper-V | `samefs_src.bin` copied to `samefs_dst.bin` on the same NTFS volume — non-resident growth across many runs within one file | SHA256 byte-exact, `chkdsk` CLEAN |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.

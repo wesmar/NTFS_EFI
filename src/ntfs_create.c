@@ -1619,17 +1619,22 @@ NtfsInsertIndexEntrySmall (
     while ((PUCHAR)Entry < (PUCHAR)Last) {
         if (Entry->Length == 0) break;
         if (!(Entry->Flags & NTFS_INDEX_ENTRY_END)) {
-            INTN Cmp;
-            UINTN i, MinLen, ELen = Entry->FileName.NameLength;
-            MinLen = (NameLen < ELen) ? NameLen : ELen;
-            Cmp = 0;
-            for (i = 0; i < MinLen; i++) {
-                WCHAR Ca = Name[i], Cb = Entry->FileName.Name[i];
-                if (Ca >= L'a' && Ca <= L'z') Ca = (WCHAR)(Ca - 32);
-                if (Cb >= L'a' && Cb <= L'z') Cb = (WCHAR)(Cb - 32);
-                if (Ca != Cb) { Cmp = (INTN)Ca - (INTN)Cb; break; }
-            }
-            if (Cmp == 0 && NameLen != ELen) Cmp = (NameLen < ELen) ? -1 : 1;
+            /*
+             * Collate with the volume's own $UpCase table, exactly like every
+             * other insert and every lookup in this driver (NtfsCreateCompareNames
+             * above, NtfsEfiCompareNames in ntfs_btree.c).
+             *
+             * This loop used to fold only a-z by hand. For ASCII that agrees with
+             * $UpCase, but not beyond it: $UpCase folds 'ą' to 'Ą', 'ł' to 'Ł',
+             * Cyrillic 'а' to 'А' - the ASCII fold leaves them distinct. So this
+             * one path ordered - and compared for equality - by a different rule
+             * than the path that later searches the same index. A small directory
+             * could end up holding both "ą.txt" and "Ą.txt" as separate entries
+             * while Windows and chkdsk see one single name there.
+             */
+            INTN  Cmp = NtfsCreateCompareNames (Name, NameLen,
+                            Entry->FileName.Name, Entry->FileName.NameLength,
+                            Vcb->UpcaseTable);
             if (Cmp == 0) {
                 NtfsEfiFreeAttrCtx (RootCtx);
                 return EFI_ACCESS_DENIED;   /* name already exists */

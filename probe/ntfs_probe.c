@@ -1503,6 +1503,73 @@ UefiMain (
                         ProbePrint (L"    create-on-existing: %r (expect Success, same file)\r\n", CrStatus);
                         if (!EFI_ERROR (CrStatus)) WFile->Close (WFile);
 
+                        /*
+                         * Collation beyond a-z. U+0105 and U+0104 are the same
+                         * letter to the volume's $UpCase table, so on a normal
+                         * case-insensitive NTFS volume "kolacja_<U+0105>.txt" and
+                         * "kolacja_<U+0104>.txt" are ONE name: creating the second
+                         * must reach the file the first one wrote, and reading it
+                         * back must return that content. A driver that folds only
+                         * a-z sees two names, makes a second index entry, and this
+                         * readback comes back empty.
+                         */
+                        {
+                            /*
+                             * Ordering, not equality - this is what the a-z fold
+                             * actually got wrong. $UpCase maps Cyrillic small a
+                             * (U+0430) to capital A (U+0410), which sorts BEFORE
+                             * capital Ya (U+042F). Folding only a-z leaves U+0430
+                             * above U+042F, i.e. AFTER it. So: create Ya first,
+                             * then small a. A driver that inserts by the a-z rule
+                             * puts small a after Ya, breaking the sorted order the
+                             * lookup descent relies on - and the very next Open of
+                             * that name walks the node, hits Ya, compares less-than
+                             * and gives up: EFI_NOT_FOUND on a file that is there.
+                             */
+                            CHAR16 NameYa[] = { L'c',L'y',L'r',L'_',0x042F,L'.',L't',L'x',L't',0 };
+                            CHAR16 NameA[]  = { L'c',L'y',L'r',L'_',0x0430,L'.',L't',L'x',L't',0 };
+                            EFI_FILE_PROTOCOL *F1 = NULL, *F2 = NULL;
+                            EFI_FILE_PROTOCOL *CsDir2 = NULL;
+                            EFI_STATUS S1, S2, S3;
+
+                            /*
+                             * A FRESH directory, because only a directory still
+                             * small enough to keep its index in a resident
+                             * $INDEX_ROOT goes through NtfsInsertIndexEntrySmall -
+                             * the one path that folded a-z by hand. Once a
+                             * directory grows an $INDEX_ALLOCATION every insert
+                             * takes the $UpCase-based path and the bug is out of
+                             * reach.
+                             */
+                            S1 = CsDir->Open (CsDir, &CsDir2, L"collate_dir",
+                                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+                                EFI_FILE_DIRECTORY);
+                            ProbePrint (L"    collate-mkdir: %r\r\n", S1);
+                            if (EFI_ERROR (S1)) CsDir2 = CsDir;
+
+                            S1 = CsDir2->Open (CsDir2, &F1, NameYa,
+                                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+                            if (!EFI_ERROR (S1)) F1->Close (F1);
+                            ProbePrint (L"    collate-create-Ya: %r\r\n", S1);
+
+                            S2 = CsDir2->Open (CsDir2, &F2, NameA,
+                                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+                            if (!EFI_ERROR (S2)) F2->Close (F2);
+                            ProbePrint (L"    collate-create-a: %r\r\n", S2);
+
+                            /* the decisive one: is the just-created name findable? */
+                            F2 = NULL;
+                            S3 = CsDir2->Open (CsDir2, &F2, NameA, EFI_FILE_MODE_READ, 0);
+                            ProbePrint (L"    collate-reopen-a: %r (expect Success)\r\n", S3);
+                            if (!EFI_ERROR (S3)) F2->Close (F2);
+
+                            F1 = NULL;
+                            S3 = CsDir2->Open (CsDir2, &F1, NameYa, EFI_FILE_MODE_READ, 0);
+                            ProbePrint (L"    collate-reopen-Ya: %r (expect Success)\r\n", S3);
+                            if (!EFI_ERROR (S3)) F1->Close (F1);
+                            if (CsDir2 != CsDir) CsDir2->Close (CsDir2);
+                        }
+
                         {
                             EFI_FILE_PROTOCOL *NewDir;
                             EFI_STATUS MkStatus = CsDir->Open (CsDir, &NewDir, L"mkdir_probe5",
