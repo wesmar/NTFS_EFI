@@ -1,6 +1,15 @@
 # build.ps1 - Kompilacja NTFS_EFI + EC + ntfs_probe (MSVC, bez EDK2 BaseTools).
 # Wynik: bin\ntfs.efi, bin\EC.efi, bin\ntfs_probe.efi
 # Archiwum release tworzy pack-data.sh (data\NTFS_EFI.7z).
+#
+#   .\build.ps1          # build produkcyjny
+#   .\build.ps1 -Diag    # diagnostyczne kody odmowy (NTFS_DIAG_STATUS=1)
+#
+# -Diag sluzy WYLACZNIE do namierzenia, ktore ograniczenie odmowilo: kazde
+# miejsce NTFS_REFUSE zwraca wtedy wlasny status zamiast jednego
+# EFI_UNSUPPORTED, ktory widzi aplikacja. Bez tego przelacznika argument znika
+# w preprocesorze, wiec build produkcyjny nie nosi po nim zadnego sladu.
+param([switch]$Diag)
 $ErrorActionPreference = "Stop"
 
 Write-Host "========================================================" -ForegroundColor Cyan
@@ -33,7 +42,9 @@ if (-not (Test-Path $binDir)) {
 # 3. Kompilacja projektu ntfs (ntfs.efi)
 Write-Host "[+] Kompilacja ntfs.vcxproj (Release)..." -ForegroundColor Yellow
 $ntfsVcxproj = Join-Path $PSScriptRoot "src\ntfs.vcxproj"
-& $msBuildPath $ntfsVcxproj /p:Configuration=$config /p:Platform=$platform /t:Rebuild /m /nologo
+$diagArg = if ($Diag) { '/p:NtfsDiag=1' } else { '/p:NtfsDiag=0' }
+if ($Diag) { Write-Host "[!] DIAGNOSTYKA: kody odmowy WLACZONE - to nie jest build release" -ForegroundColor Yellow }
+& $msBuildPath $ntfsVcxproj /p:Configuration=$config /p:Platform=$platform $diagArg /t:Rebuild /m /nologo
 if ($LASTEXITCODE -ne 0) { Write-Error "Kompilacja ntfs.vcxproj nie powiodła się." }
 
 # 4. Kompilacja projektu EC (EC.efi)

@@ -10,6 +10,12 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
+  <!-- Diagnostic refusal codes: 0 (default) makes every NTFS_REFUSE site return
+       plain EFI_UNSUPPORTED with no codegen cost; msbuild /p:NtfsDiag=1 (build.ps1
+       -Diag) makes each site return its own distinct status instead. -->
+  <PropertyGroup>
+    <NtfsDiag Condition="'$(NtfsDiag)'==''">0</NtfsDiag>
+  </PropertyGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
@@ -87,7 +93,7 @@
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <StructMemberAlignment>Default</StructMemberAlignment>
-      <PreprocessorDefinitions>UEFI_BUILD;NDEBUG;ENABLE_DEBUG_LOG=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>UEFI_BUILD;NDEBUG;ENABLE_DEBUG_LOG=0;NTFS_DIAG_STATUS=$(NtfsDiag);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <DisableSpecificWarnings>4100;4127;4152;4200;4201;4204;4214;4221;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <AdditionalOptions>/Gs32768 /Brepro %(AdditionalOptions)</AdditionalOptions>

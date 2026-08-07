@@ -77,6 +77,45 @@ VOID NtfsEfiDebugPrint (IN CONST CHAR16 *Fmt, ...);
 #define Print(...) ((VOID)0)
 #endif
 
+/*
+ * Refusal codes: which boundary said no.
+ *
+ * A dozen different limits in the write path all refuse the same way, with
+ * EFI_UNSUPPORTED. That is the right thing to report to an application - the
+ * operation is not supported on this volume, nothing was modified - but it
+ * tells whoever is debugging nothing at all about WHICH limit was reached, and
+ * a UEFI driver has no log to consult afterwards. Bisecting it by rebuilding
+ * with a hand-edited status at each candidate site is exactly the kind of
+ * throwaway work that gets left in the tree by accident.
+ *
+ * So every such site names its own distinct status, permanently, and the macro
+ * decides what actually gets returned:
+ *
+ *   NTFS_DIAG_STATUS == 0 (production, the default)
+ *       expands to EFI_UNSUPPORTED. The argument is discarded by the
+ *       preprocessor, so the generated code is byte-identical to a plain
+ *       `return EFI_UNSUPPORTED;` - no branch, no table, no string, no cost.
+ *
+ *   NTFS_DIAG_STATUS == 1 (diagnostic build: build.ps1 -Diag)
+ *       returns the site's own status instead, which %r prints by name. One
+ *       run of the probe then says which boundary refused, with no rebuild
+ *       cycle and no code left behind afterwards.
+ *
+ * The codes are chosen from statuses this driver never returns for real
+ * (EFI_NO_MEDIA, EFI_TIMEOUT, ...), so a diagnostic run cannot be confused
+ * with a genuine failure. Callers must keep treating any error as an error -
+ * never test for one of these specific values outside a diagnostic build.
+ */
+#ifndef NTFS_DIAG_STATUS
+#define NTFS_DIAG_STATUS 0
+#endif
+
+#if NTFS_DIAG_STATUS
+#define NTFS_REFUSE(DiagStatus)  (DiagStatus)
+#else
+#define NTFS_REFUSE(DiagStatus)  EFI_UNSUPPORTED
+#endif
+
 /* perf counters (ntfs_diskio.c) - deterministic DiskIo round-trip metric */
 extern UINT64 gNtfsReadCalls;
 extern UINT64 gNtfsWriteCalls;

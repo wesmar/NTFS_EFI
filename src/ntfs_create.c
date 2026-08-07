@@ -419,10 +419,38 @@ Cleanup:
 /* Read the sub-node VCN a NODE index entry points at (last 8 bytes). */
 #define NTFS_ENTRY_SUBVCN(e)  (*(UINT64 *)((PUCHAR)(e) + (e)->Length - sizeof (UINT64)))
 
-/* Allocate one fresh INDX-block cluster and splice it into the directory's
- * $INDEX_ALLOCATION (mapping pairs + sizes) and $BITMAP:$I30. Chains the
- * mapping-pair delta base through *LastRealLCN across a whole insert. On any
- * failure the cluster is freed and the record left as it was. */
+/*
+ * Hand out one INDX block for the directory's index, in this order:
+ *
+ *   1. A block the directory ALREADY OWNS but is not using. Two things leave
+ *      those behind. Deleting every entry collapses the index back to a
+ *      resident $INDEX_ROOT and clears the $BITMAP:$I30 bits, but deliberately
+ *      keeps the $INDEX_ALLOCATION mapping - the clusters stay owned. And the
+ *      chunked growth below allocates several blocks per run on purpose. Either
+ *      way the block is already mapped, so reusing it costs NO mapping pair.
+ *
+ *   2. Otherwise a fresh CHUNK of contiguous clusters - several blocks in ONE
+ *      run - falling back to smaller chunks when the volume cannot place them
+ *      contiguously. Only the first block is put to use here; the rest become
+ *      case 1 for the next split.
+ *
+ * Why it matters: the mapping pairs live inside the directory's 1 KB MFT
+ * record, and this driver cannot spill attributes into an $ATTRIBUTE_LIST
+ * extension record. One run per block, never reused, is therefore a hard
+ * budget - and a directory that is filled and emptied repeatedly (a copy
+ * target used over and over) burns it without ever growing: one measured in
+ * the field held 106 runs of a single cluster each in 512 of its 1024 record
+ * bytes, with exactly ONE block still in use. The next split had nowhere to
+ * put run 107, so every create in that directory failed with EFI_UNSUPPORTED
+ * while 105 of its own blocks sat unused. Reuse removes that failure
+ * outright; the chunking cuts the mapping pairs a growing directory needs by
+ * the chunk factor.
+ *
+ * Chains the mapping-pair delta base through *LastRealLCN across a whole
+ * insert. On any failure the clusters are freed and the record left as it was.
+ */
+#define NTFS_INDEX_ALLOC_CHUNK  8   /* blocks per mapping pair when growing */
+
 static EFI_STATUS
 NtfsBtreeAllocBlock (
     IN     PNTFS_EFI_VCB       Vcb,
@@ -443,82 +471,151 @@ NtfsBtreeAllocBlock (
     )
 {
     UINT64            ClustersPer = Vcb->BytesPerIndexRecord / Vcb->BytesPerCluster;
-    UINT64            StartLCN, Got;
+    UINT64            StartLCN = 0, Got = 0;
     PNTFS_ATTR_RECORD AllocAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + AllocOffset);
     ULONG             BmOff = 0;
     PNTFS_ATTR_CTX    BmProbe;
     PNTFS_ATTR_RECORD BmAttr;
     PUCHAR            BmVal;
+    UINT64            OwnedBlocks;
+    UINT64            ChunkBlocks;
+    BOOLEAN           Reused = FALSE;
 
-    *NewVCN = (UINT64)AllocAttr->NonResident.HighestVCN + 1;
-    if (EFI_ERROR (NtfsEfiAllocateClusters (Vcb, ClustersPer, &StartLCN, &Got)) || Got < ClustersPer) {
-        if (Got) NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-        return EFI_VOLUME_FULL;
-    }
-    *NewLcn = (INT64)StartLCN;
-    if (!NtfsAppendRunToAttr (Vcb, DirRec, AllocOffset, StartLCN, ClustersPer, *LastRealLCN)) {
-        NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-        return EFI_UNSUPPORTED;   /* record has no room for another mapping pair */
-    }
-    *LastRealLCN = (INT64)StartLCN;
-    AllocAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + AllocOffset);   /* stable: before $BITMAP */
-    AllocAttr->NonResident.DataSize        = (LONGLONG)((*NewVCN + 1) * Vcb->BytesPerIndexRecord);
-    AllocAttr->NonResident.InitializedSize = AllocAttr->NonResident.DataSize;
+    if (ClustersPer == 0) return EFI_VOLUME_CORRUPTED;
+    OwnedBlocks = ((UINT64)AllocAttr->NonResident.HighestVCN + 1) / ClustersPer;
 
-    /*
-     * Mirror the new extent into the caller's decoded run list, matching what
-     * NtfsAppendRunToAttr just did to the record: merge into the tail run when
-     * physically contiguous, otherwise append. Without this the very next
-     * NtfsEfiReadAttr for this VCN returns short, and the B+tree insert reports
-     * EFI_VOLUME_CORRUPTED on a perfectly good volume - which is what a real
-     * \Windows\System32 copy hit after ~1750 files, once a directory of
-     * long-named entries needed a second block inside one insert.
-     */
-    if (AllocCtx != NULL) {
-        ULONG rc = AllocCtx->RunCount;
-        if (rc > 0 && AllocCtx->Runs[rc - 1].LBN != -1LL &&
-            (UINT64)(AllocCtx->Runs[rc - 1].LBN + AllocCtx->Runs[rc - 1].Len) == StartLCN) {
-            AllocCtx->Runs[rc - 1].Len += ClustersPer;
-        } else if (rc < NTFS_MAX_RUNS) {
-            UINT64 NextVBN = (rc > 0)
-                ? (AllocCtx->Runs[rc - 1].VBN + AllocCtx->Runs[rc - 1].Len)
-                : 0;
-            AllocCtx->Runs[rc].VBN = NextVBN;
-            AllocCtx->Runs[rc].LBN = (INT64)StartLCN;
-            AllocCtx->Runs[rc].Len = ClustersPer;
-            AllocCtx->RunCount     = rc + 1;
-        } else {
-            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-            return EFI_UNSUPPORTED;   /* run list full - refuse, do not read short */
-        }
-        /* the context's own copy of the attribute header must agree, since
-         * NtfsEfiAttrDataLength and the read path both consult it */
-        AllocCtx->pRecord->NonResident.HighestVCN      = (LONGLONG)(*NewVCN + ClustersPer - 1);
-        AllocCtx->pRecord->NonResident.DataSize        = AllocAttr->NonResident.DataSize;
-        AllocCtx->pRecord->NonResident.InitializedSize = AllocAttr->NonResident.InitializedSize;
-        AllocCtx->pRecord->NonResident.AllocatedSize   = AllocAttr->NonResident.AllocatedSize;
-    }
-
-    /* the append shifted $BITMAP forward - re-find it */
+    /* ---- 1. a block already mapped but not in use ---- */
     BmProbe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap, L"$I30", 4, &BmOff);
-    if (BmProbe == NULL) { NtfsEfiFreeClusters (Vcb, StartLCN, Got); return EFI_VOLUME_CORRUPTED; }
+    if (BmProbe == NULL) return EFI_VOLUME_CORRUPTED;
     NtfsEfiFreeAttrCtx (BmProbe);
     BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + BmOff);
-    if (BmAttr->IsNonResident || *NewVCN / 8 >= BmAttr->Resident.ValueLength) {
-        /* grow the resident $BITMAP:$I30 to cover the new block's bit (64 more
-         * bits per 8 bytes). $BITMAP is the last attribute before the record
-         * END marker, so growing it only shifts that 4-byte terminator. A
-         * non-resident index bitmap (enormous directories) is not handled. */
-        ULONG NewBmValLen = (ULONG)ROUND_UP (*NewVCN / 8 + 1, 8);
-        if (BmAttr->IsNonResident ||
-            !NtfsEfiGrowResidentInRecord (Vcb, DirRec, BmOff, NewBmValLen)) {
-            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-            return EFI_UNSUPPORTED;
+    if (!BmAttr->IsNonResident && AllocCtx != NULL) {
+        UINT64 Bits = (UINT64)BmAttr->Resident.ValueLength * 8;
+        UINT64 i;
+        BmVal = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
+        if (Bits > OwnedBlocks) Bits = OwnedBlocks;
+        for (i = 0; i < Bits; i++) {
+            if (!((BmVal[i / 8] >> (i % 8)) & 1)) {
+                INT64 Lcn = NtfsVcnToLcn (AllocCtx, i * ClustersPer);
+                if (Lcn < 0) continue;              /* sparse/unmapped - skip it */
+                *NewVCN = i;
+                *NewLcn = Lcn;
+                Reused  = TRUE;
+                break;
+            }
         }
-        BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + BmOff);   /* start unchanged */
     }
-    BmVal = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
-    BmVal[*NewVCN / 8] |= (UCHAR)(1U << (*NewVCN % 8));
+
+    if (Reused) {
+        /*
+         * Nothing about the mapping changes, so neither does the run list nor
+         * any following attribute - only the data size, and only when this
+         * block sits beyond what the attribute currently exposes. The bit is
+         * set at the end, on the same path as the fresh-chunk case.
+         */
+        UINT64 NeedSize = (*NewVCN + 1) * Vcb->BytesPerIndexRecord;
+        if ((UINT64)AllocAttr->NonResident.DataSize < NeedSize) {
+            AllocAttr->NonResident.DataSize        = (LONGLONG)NeedSize;
+            AllocAttr->NonResident.InitializedSize = (LONGLONG)NeedSize;
+            if (AllocCtx != NULL) {
+                AllocCtx->pRecord->NonResident.DataSize        = AllocAttr->NonResident.DataSize;
+                AllocCtx->pRecord->NonResident.InitializedSize = AllocAttr->NonResident.InitializedSize;
+            }
+        }
+    } else {
+        /* ---- 2. a fresh contiguous chunk, one run for several blocks ---- */
+        *NewVCN = OwnedBlocks;
+
+        for (ChunkBlocks = NTFS_INDEX_ALLOC_CHUNK; ; ChunkBlocks /= 2) {
+            if (!EFI_ERROR (NtfsEfiAllocateClusters (Vcb, ChunkBlocks * ClustersPer, &StartLCN, &Got)) &&
+                Got >= ChunkBlocks * ClustersPer) {
+                break;
+            }
+            if (Got) NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            Got = 0;
+            if (ChunkBlocks == 1) return EFI_VOLUME_FULL;
+        }
+        Got = ChunkBlocks * ClustersPer;   /* whole blocks only */
+
+        *NewLcn = (INT64)StartLCN;
+        if (!NtfsAppendRunToAttr (Vcb, DirRec, AllocOffset, StartLCN, Got, *LastRealLCN)) {
+            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            return NTFS_REFUSE (EFI_NO_MEDIA);   /* record has no room for another mapping pair */
+        }
+        *LastRealLCN = (INT64)StartLCN;
+        AllocAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + AllocOffset);   /* stable: before $BITMAP */
+        /* only the FIRST block of the chunk goes into use; the rest stay mapped,
+         * unused and bit-clear, for case 1 above to hand out */
+        AllocAttr->NonResident.DataSize        = (LONGLONG)((*NewVCN + 1) * Vcb->BytesPerIndexRecord);
+        AllocAttr->NonResident.InitializedSize = AllocAttr->NonResident.DataSize;
+
+        /*
+         * Mirror the new extent into the caller's decoded run list, matching what
+         * NtfsAppendRunToAttr just did to the record: merge into the tail run when
+         * physically contiguous, otherwise append. Without this the very next
+         * NtfsEfiReadAttr for this VCN returns short, and the B+tree insert reports
+         * EFI_VOLUME_CORRUPTED on a perfectly good volume - which is what a real
+         * \Windows\System32 copy hit after ~1750 files, once a directory of
+         * long-named entries needed a second block inside one insert.
+         */
+        if (AllocCtx != NULL) {
+            ULONG rc = AllocCtx->RunCount;
+            if (rc > 0 && AllocCtx->Runs[rc - 1].LBN != -1LL &&
+                (UINT64)(AllocCtx->Runs[rc - 1].LBN + AllocCtx->Runs[rc - 1].Len) == StartLCN) {
+                AllocCtx->Runs[rc - 1].Len += Got;
+            } else if (rc < NTFS_MAX_RUNS) {
+                UINT64 NextVBN = (rc > 0)
+                    ? (AllocCtx->Runs[rc - 1].VBN + AllocCtx->Runs[rc - 1].Len)
+                    : 0;
+                AllocCtx->Runs[rc].VBN = NextVBN;
+                AllocCtx->Runs[rc].LBN = (INT64)StartLCN;
+                AllocCtx->Runs[rc].Len = Got;
+                AllocCtx->RunCount     = rc + 1;
+            } else {
+                NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+                return NTFS_REFUSE (EFI_MEDIA_CHANGED);   /* run list full - refuse, do not read short */
+            }
+            /* the context's own copy of the attribute header must agree, since
+             * NtfsEfiAttrDataLength and the read path both consult it */
+            AllocCtx->pRecord->NonResident.HighestVCN      = AllocAttr->NonResident.HighestVCN;
+            AllocCtx->pRecord->NonResident.DataSize        = AllocAttr->NonResident.DataSize;
+            AllocCtx->pRecord->NonResident.InitializedSize = AllocAttr->NonResident.InitializedSize;
+            AllocCtx->pRecord->NonResident.AllocatedSize   = AllocAttr->NonResident.AllocatedSize;
+        }
+
+        /* the append shifted $BITMAP forward - re-find it */
+        BmProbe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap, L"$I30", 4, &BmOff);
+        if (BmProbe == NULL) { NtfsEfiFreeClusters (Vcb, StartLCN, Got); return EFI_VOLUME_CORRUPTED; }
+        NtfsEfiFreeAttrCtx (BmProbe);
+        BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + BmOff);
+    }
+
+    /*
+     * Set this block's allocation bit. The bitmap has to cover every block the
+     * directory owns, not just the one going into use now, or the reuse scan
+     * above would never see the chunk's spare blocks.
+     */
+    {
+        UINT64 NeedBits  = ((UINT64)AllocAttr->NonResident.HighestVCN + 1) / ClustersPer;
+        UINT64 NeedBytes = ROUND_UP ((NeedBits + 7) / 8, 8);
+        UINT64 BitByte   = ROUND_UP (*NewVCN / 8 + 1, 8);
+
+        if (NeedBytes < BitByte) NeedBytes = BitByte;
+        if (BmAttr->IsNonResident || (UINT64)BmAttr->Resident.ValueLength < NeedBytes) {
+            /* grow the resident $BITMAP:$I30 (64 more bits per 8 bytes). $BITMAP is
+             * the last attribute before the record END marker, so growing it only
+             * shifts that 4-byte terminator. A non-resident index bitmap (enormous
+             * directories) is not handled. */
+            if (BmAttr->IsNonResident ||
+                !NtfsEfiGrowResidentInRecord (Vcb, DirRec, BmOff, NeedBytes)) {
+                if (!Reused) NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+                return NTFS_REFUSE (EFI_WRITE_PROTECTED);
+            }
+            BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + BmOff);   /* start unchanged */
+        }
+        BmVal = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
+        BmVal[*NewVCN / 8] |= (UCHAR)(1U << (*NewVCN % 8));
+    }
     return EFI_SUCCESS;
 }
 
@@ -683,7 +780,7 @@ NtfsBtreeInsertRec (
      * node, so depth 12 already covers directories with billions of entries;
      * anything deeper is a corrupt/looping index, not a real directory.
      */
-    if (Depth > 12) return EFI_UNSUPPORTED;
+    if (Depth > 12) return NTFS_REFUSE (EFI_TIMEOUT);
 
     NodeBuf = AllocatePool (Vcb->BytesPerIndexRecord);
     if (NodeBuf == NULL) return EFI_OUT_OF_RESOURCES;
@@ -748,13 +845,13 @@ NtfsBtreeInsertRec (
                     NtfsCreateCompareNames (Name, NameLen, E->FileName.Name, E->FileName.NameLength, Vcb->UpcaseTable) < 0) {
                     Ord[NOrd++] = NewEntry; Inserted = TRUE;
                 }
-                if (NOrd >= 510) { FreePool (NodeBuf); return EFI_UNSUPPORTED; }
+                if (NOrd >= 510) { FreePool (NodeBuf); return NTFS_REFUSE (EFI_PROTOCOL_ERROR); }
                 Ord[NOrd++] = E;
                 E = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)E + E->Length);
             }
             if (!Inserted) Ord[NOrd++] = NewEntry;
         }
-        if (NOrd < 2) { FreePool (NodeBuf); return EFI_UNSUPPORTED; }
+        if (NOrd < 2) { FreePool (NodeBuf); return NTFS_REFUSE (EFI_INCOMPATIBLE_VERSION); }
         Half = NOrd / 2;
 
         Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, LastRealLCN, AllocCtx, &NewVCN, &NewLcn);
@@ -837,14 +934,14 @@ LeafCleanup:
         while ((PUCHAR)E < (PUCHAR)EndE) {
             if (E->Flags & NTFS_INDEX_ENTRY_END) break;
             if (E == Slot) { Ord[NOrd++] = (PINDEX_ENTRY_ATTRIBUTE)ChildSep; }
-            if (NOrd >= 510) { FreePool (NodeBuf); return EFI_UNSUPPORTED; }
+            if (NOrd >= 510) { FreePool (NodeBuf); return NTFS_REFUSE (EFI_SECURITY_VIOLATION); }
             Ord[NOrd++] = E;
             E = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)E + E->Length);
         }
         /* Slot may be the END entry (ChildSep goes just before END) */
         if (Slot->Flags & NTFS_INDEX_ENTRY_END) Ord[NOrd++] = (PINDEX_ENTRY_ATTRIBUTE)ChildSep;
 
-        if (NOrd < 2) { FreePool (NodeBuf); return EFI_UNSUPPORTED; }
+        if (NOrd < 2) { FreePool (NodeBuf); return NTFS_REFUSE (EFI_CRC_ERROR); }
         Half = NOrd / 2;
 
         Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, LastRealLCN, AllocCtx, &NewVCN, &NewLcn);
@@ -934,7 +1031,7 @@ NtfsRootInsertSep (
 
     InsertOff = (UINT64)((PUCHAR)Slot - Val);
     NewValLen = 16 + (UINT64)Ir->Header.TotalSizeOfEntries + SepLen;
-    if (!NtfsEfiGrowResidentInRecord (Vcb, Rec, RootOffset, NewValLen)) return EFI_UNSUPPORTED;
+    if (!NtfsEfiGrowResidentInRecord (Vcb, Rec, RootOffset, NewValLen)) return NTFS_REFUSE (EFI_END_OF_MEDIA);
 
     RA  = (PNTFS_ATTR_RECORD)((PUCHAR)Rec + RootOffset);
     Val = (PUCHAR)RA + RA->Resident.ValueOffset;
@@ -994,7 +1091,7 @@ NtfsBtreePushDownRoot (
     while ((PUCHAR)R < (PUCHAR)REnd) {
         if (R->Length == 0) { FreePool (Temp); return EFI_VOLUME_CORRUPTED; }
         if (R->Flags & NTFS_INDEX_ENTRY_END) break;
-        if (NOrd >= 510) { FreePool (Temp); return EFI_UNSUPPORTED; }
+        if (NOrd >= 510) { FreePool (Temp); return NTFS_REFUSE (EFI_END_OF_FILE); }
         Ord[NOrd++] = R;
         R = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)R + R->Length);
     }
@@ -1022,16 +1119,22 @@ NtfsBtreePushDownRoot (
         RootRec->BytesInUse = (ULONG)((LONG)RootRec->BytesInUse + Delta);
     }
 
-    /* re-find $INDEX_ALLOCATION (the shrink shifted it back) */
+    /*
+     * Re-find $INDEX_ALLOCATION (the shrink shifted it back) and keep the
+     * context: NtfsBtreeAllocBlock needs a decoded run list to hand out a block
+     * the directory already owns, and without one it can only append yet
+     * another mapping pair to a record that is short of room in the first place
+     * - which is exactly the situation a push-down is called in.
+     */
     {
         ULONG          Fresh = 0;
         PNTFS_ATTR_CTX P = NtfsEfiFindAttrInRecord (Vcb, AllocRec, AttributeIndexAllocation, L"$I30", 4, &Fresh);
         if (P == NULL) { FreePool (Temp); return EFI_VOLUME_CORRUPTED; }
-        NtfsEfiFreeAttrCtx (P);
         *AllocOffset = Fresh;
-    }
 
-    Status = NtfsBtreeAllocBlock (Vcb, AllocRec, *AllocOffset, LastRealLCN, NULL, &WVcn, &WLcn);
+        Status = NtfsBtreeAllocBlock (Vcb, AllocRec, *AllocOffset, LastRealLCN, P, &WVcn, &WLcn);
+        NtfsEfiFreeAttrCtx (P);
+    }
     if (EFI_ERROR (Status)) { FreePool (Temp); return Status; }
 
     WBuf = AllocatePool (Vcb->BytesPerIndexRecord);
@@ -1091,7 +1194,7 @@ NtfsInsertIndexAllocationEntry (
     ULONG                  i;
     EFI_STATUS             Status = EFI_UNSUPPORTED;
 
-    if (16 + KeyLen > sizeof (NewEntryBuf)) return EFI_UNSUPPORTED;
+    if (16 + KeyLen > sizeof (NewEntryBuf)) return NTFS_REFUSE (EFI_INVALID_LANGUAGE);
 
     /*
      * Find $INDEX_ROOT inside the record that actually holds it, so RootOffset
@@ -1103,7 +1206,7 @@ NtfsInsertIndexAllocationEntry (
      * grow/shift code needs.
      */
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
-    if (RootCtx == NULL) return EFI_UNSUPPORTED;
+    if (RootCtx == NULL) return NTFS_REFUSE (EFI_COMPROMISED_DATA);
     /* everything below derives entry pointers and shift lengths from this
      * header's on-disk offsets - reject an implausible one up front */
     if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset))) {
@@ -1116,7 +1219,7 @@ NtfsInsertIndexAllocationEntry (
     if (AllocCtx == NULL || AllocOffset == 0 || BitmapOffset == 0) {
         NtfsEfiFreeAttrCtx (RootCtx);
         if (AllocCtx) NtfsEfiFreeAttrCtx (AllocCtx);
-        return EFI_UNSUPPORTED;
+        return NTFS_REFUSE (EFI_NO_RESPONSE);
     }
 
     /*
@@ -1149,8 +1252,43 @@ NtfsInsertIndexAllocationEntry (
                 goto Done;
             }
 
+            /*
+             * VCN 0 normally still has its cluster - the collapse keeps the
+             * mapping. But WINDOWS releases it: delete every file in a large
+             * directory from Windows and it hands the index clusters back,
+             * leaving $INDEX_ALLOCATION:$I30 present with HighestVCN = -1,
+             * AllocatedSize = 0 and no runs at all. That is a perfectly valid
+             * empty directory, and calling it corrupt refused every single
+             * create in it - 417 of 417 on a real \Test emptied from Windows.
+             * Allocate the block instead; the allocator sets the bitmap bit,
+             * the sizes and the mapping, so only the offsets need re-probing.
+             */
             Lcn0 = NtfsVcnToLcn (AllocCtx, 0);
-            if (Lcn0 < 0) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+            if (Lcn0 < 0) {
+                UINT64 FreshVcn = 0;
+                INT64  FreshLcn = 0;
+
+                Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, &LastRealLCN,
+                                              AllocCtx, &FreshVcn, &FreshLcn);
+                if (EFI_ERROR (Status)) goto Done;
+                if (FreshVcn != 0) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+                Lcn0 = FreshLcn;
+
+                /* the mapping-pair append shifted $BITMAP and the end marker */
+                Probe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexAllocation,
+                                                 L"$I30", 4, &AllocOffset);
+                if (Probe == NULL) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+                NtfsEfiFreeAttrCtx (Probe);
+                Probe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap,
+                                                 L"$I30", 4, &BitmapOffset);
+                if (Probe == NULL) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
+                NtfsEfiFreeAttrCtx (Probe);
+
+                /* RootRec may be this same record: re-derive the root pointers */
+                RA = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
+                Ir = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
+                End = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header + Ir->Header.FirstEntryOffset);
+            }
 
             EmptyBlock = AllocatePool (Vcb->BytesPerIndexRecord);
             if (EmptyBlock == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
@@ -1161,7 +1299,7 @@ NtfsInsertIndexAllocationEntry (
 
             if (!NtfsEfiGrowResidentInRecord (Vcb, RootRec, RootOffset,
                                                RA->Resident.ValueLength + 8)) {
-                Status = EFI_UNSUPPORTED;
+                Status = NTFS_REFUSE (EFI_NO_MAPPING);
                 goto Done;
             }
 
@@ -1189,7 +1327,7 @@ NtfsInsertIndexAllocationEntry (
             {
                 PNTFS_ATTR_RECORD Bm = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + BitmapOffset);
                 if (Bm->IsNonResident || Bm->Resident.ValueLength == 0) {
-                    Status = EFI_UNSUPPORTED;
+                    Status = NTFS_REFUSE (EFI_ABORTED);
                     goto Done;
                 }
                 *((PUCHAR)Bm + Bm->Resident.ValueOffset) |= 1;
@@ -1271,7 +1409,7 @@ NtfsInsertIndexAllocationEntry (
         }
         Entry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)Entry + Entry->Length);
     }
-    if (!HaveTarget) { Status = EFI_UNSUPPORTED; goto Done; }
+    if (!HaveTarget) { Status = NTFS_REFUSE (EFI_NOT_READY); goto Done; }
 
     {
         NTFS_PENDING_SPLITS Pending;
@@ -1447,7 +1585,7 @@ NtfsConvertRootToSingleIndexAllocation (
     NextAttr = (PNTFS_ATTR_RECORD)((PUCHAR)RootAttr + RootAttr->Length);
     if (NextAttr->Type != (ULONG)AttributeEnd) {
         Print (L"[convert] root-not-last type=%x\n", NextAttr->Type);
-        return EFI_UNSUPPORTED;
+        return NTFS_REFUSE (EFI_HTTP_ERROR);
     }
 
     Status = NtfsEfiAllocateClusters (Vcb,
@@ -1456,7 +1594,7 @@ NtfsConvertRootToSingleIndexAllocation (
     if (EFI_ERROR (Status)) return Status;
     if (Got < Vcb->BytesPerIndexRecord / Vcb->BytesPerCluster) {
         NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-        return EFI_UNSUPPORTED;
+        return NTFS_REFUSE (EFI_LOAD_ERROR);
     }
 
     Status = NtfsWriteNewIndexBufferDirect (Vcb, StartLCN,
@@ -1484,7 +1622,7 @@ NtfsConvertRootToSingleIndexAllocation (
             Print (L"[convert] no-room need=%d off=%d balloc=%d biu=%d\n",
                 (UINT32)NeedBytes, (UINT32)RootOffset, (UINT32)DirRec->BytesAllocated, (UINT32)DirRec->BytesInUse);
             NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-            return EFI_UNSUPPORTED;
+            return NTFS_REFUSE (EFI_BUFFER_TOO_SMALL);
         }
     }
 
@@ -1754,7 +1892,7 @@ NtfsCreateFileRecord (
 
         if (Rec->BytesInUse > Rec->BytesAllocated) {
             FreePool (Rec);
-            return EFI_UNSUPPORTED;   /* shouldn't happen: fixed-size attrs, huge record slack */
+            return NTFS_REFUSE (EFI_VOLUME_FULL);   /* shouldn't happen: fixed-size attrs, huge record slack */
         }
     }
 
@@ -1803,7 +1941,7 @@ NtfsInsertIndexEntrySmall (
     PINDEX_ENTRY_ATTRIBUTE NewEntry = (PINDEX_ENTRY_ATTRIBUTE)NewEntryBuf;
     PUCHAR             ValPtr;
 
-    if (RootCtx == NULL) return EFI_UNSUPPORTED;   /* resolver guarantees otherwise */
+    if (RootCtx == NULL) return NTFS_REFUSE (EFI_DEVICE_ERROR);   /* resolver guarantees otherwise */
 
     /* EntryLen (the 8-aligned entry size) is what gets zeroed and copied below,
      * so that - not 16+KeyLen+16 - is the buffer requirement. The old check
@@ -1811,7 +1949,7 @@ NtfsInsertIndexEntrySmall (
      * chars and up even though the entry fit. */
     if (EntryLen > sizeof (NewEntryBuf)) {
         NtfsEfiFreeAttrCtx (RootCtx);
-        return EFI_UNSUPPORTED;   /* pathological name length */
+        return NTFS_REFUSE (EFI_BAD_BUFFER_SIZE);   /* pathological name length */
     }
     if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
         NtfsEfiFreeAttrCtx (RootCtx);

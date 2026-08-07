@@ -754,6 +754,21 @@ The driver and the probe build at `/W4 /WX` — warning-free, with warnings prom
 | `bin\EC.efi` | EFI Commander |
 | `bin\ntfs_probe.efi` | Test harness and tree-copy benchmark |
 
+### Diagnostic refusal codes
+
+A dozen separate limits in the write path all refuse the same way — `EFI_UNSUPPORTED`, nothing modified — which is exactly what an application should see and exactly what tells you nothing when you are the one debugging it. A UEFI driver has no log to read afterwards, so each of those sites names its own distinct status through one macro:
+
+```c
+return NTFS_REFUSE (EFI_NO_MEDIA);   /* no record room for another mapping pair */
+```
+
+```powershell
+.\build.ps1          # production: NTFS_REFUSE(x) expands to EFI_UNSUPPORTED
+.\build.ps1 -Diag    # diagnostic: each site returns its own status, printed by %r
+```
+
+In a production build the argument is discarded by the preprocessor, so the generated code is identical to a plain `return EFI_UNSUPPORTED;` — verified by hash: the release binary is byte-for-byte the same with the mechanism in place as without it. One `-Diag` run then names the boundary that refused, with no bisecting rebuilds and nothing left behind in the tree. The codes are picked from statuses the driver never returns for real (`EFI_NO_MEDIA`, `EFI_TIMEOUT`, …), so a diagnostic run can never be mistaken for a genuine failure — and no caller may test for them: outside a `-Diag` build they do not exist.
+
 ---
 
 ## License
