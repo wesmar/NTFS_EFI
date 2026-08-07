@@ -32,9 +32,11 @@ NtfsScanBitmapRange (
     OUT UINT64 *OutLen
     )
 {
-    UINT64 RunStart = (UINT64)-1;
-    UINT64 RunLen   = 0;
-    UINT64 Bit      = FromBit;
+    UINT64 RunStart  = (UINT64)-1;
+    UINT64 RunLen    = 0;
+    UINT64 BestStart = 0;
+    UINT64 BestLen   = 0;
+    UINT64 Bit       = FromBit;
 
     while (Bit < ToBit) {
         /* Fast-skip fully-allocated regions, but only when no free run is
@@ -62,16 +64,34 @@ NtfsScanBitmapRange (
             if (!Used) {
                 if (RunStart == (UINT64)-1) RunStart = Bit;
                 RunLen++;
-                if (RunLen >= ClustersNeeded) break;
+                if (RunLen >= ClustersNeeded) {
+                    BestStart = RunStart;
+                    BestLen   = RunLen;
+                    break;
+                }
             } else {
+                /* Keep the longest run seen so far, not merely the last one.
+                 * A caller that asks for a big chunk and settles for less -
+                 * $MFT growth - would otherwise be handed whatever few free
+                 * clusters happen to sit at the end of the range, while a
+                 * much longer run earlier in it was scanned past and
+                 * forgotten. */
+                if (RunLen > BestLen) {
+                    BestStart = RunStart;
+                    BestLen   = RunLen;
+                }
                 RunStart = (UINT64)-1;
-                RunLen = 0;
+                RunLen   = 0;
             }
         }
         Bit++;
     }
-    *OutStart = (RunLen == 0) ? 0 : RunStart;
-    *OutLen   = RunLen;
+    if (RunLen > BestLen) {
+        BestStart = RunStart;
+        BestLen   = RunLen;
+    }
+    *OutStart = (BestLen == 0) ? 0 : BestStart;
+    *OutLen   = BestLen;
 }
 
 /*
@@ -196,6 +216,9 @@ Done:
     return Status;
 }
 
+/* clusters per $MFT growth - 1 MiB, i.e. 1024 records at 1 KB each */
+#define NTFS_MFT_GROW_CLUSTERS 256
+
 static EFI_STATUS
 NtfsGrowMft (
     IN PNTFS_EFI_VCB Vcb
@@ -210,10 +233,18 @@ NtfsGrowMft (
 
     Print (L"[ntfs] NtfsGrowMft: growing Master File Table...\n");
 
-    /* grow in chunks so we do not rebuild MFT record 0 once per 4 records;
-     * run-merging keeps the mapping pairs compact when the chunk is
-     * contiguous with the previous $MFT extent. */
-    Status = NtfsEfiAllocateClusters (Vcb, 16, &StartLCN, &Got);
+    /*
+     * Grow by a large chunk. Every growth that is not physically contiguous
+     * with the previous $MFT extent costs one more mapping pair inside record
+     * 0, and that record is 1 KB with no $ATTRIBUTE_LIST to spill into: at 16
+     * clusters a chunk the table stops growing after about 7 000 records on a
+     * fragmented volume, with the record's own attribute space, not the disk,
+     * as the limit. The allocator hands back the longest contiguous run it can
+     * find up to the amount asked for, so asking for more never fails - it
+     * just returns a shorter run - while on a volume with free space it buys
+     * 1024 records for the same single mapping pair.
+     */
+    Status = NtfsEfiAllocateClusters (Vcb, NTFS_MFT_GROW_CLUSTERS, &StartLCN, &Got);
     if (EFI_ERROR (Status)) return Status;
     if (Got < 1) {
         NtfsEfiFreeClusters (Vcb, StartLCN, Got);
@@ -277,12 +308,146 @@ NtfsGrowMft (
 }
 
 /*
+ * Write MFT record 0 back and keep the VCB's cached copy of it in step.
+ *
+ * NtfsGrowMft edits Vcb->MasterFileTable - the VCB's own image of record 0 -
+ * and writes THAT to disk wholesale. Anything stored into record 0 from a
+ * local copy without refreshing the cache is therefore undone by the next
+ * growth. Every record-0 write in this file goes through here.
+ */
+static EFI_STATUS
+NtfsWriteMftRec0 (
+    IN PNTFS_EFI_VCB       Vcb,
+    IN PFILE_RECORD_HEADER Rec
+    )
+{
+    EFI_STATUS     Status;
+    PNTFS_ATTR_CTX Ctx;
+    ULONG          DataOffset = 0;
+
+    Status = NtfsEfiWriteFileRecord (Vcb, NTFS_FILE_MFT, Rec);
+    if (EFI_ERROR (Status)) return Status;
+
+    CopyMem (Vcb->MasterFileTable, Rec, Vcb->BytesPerFileRecord);
+    Ctx = NtfsEfiFindAttrInRecord (Vcb, Vcb->MasterFileTable, AttributeData, NULL, 0, &DataOffset);
+    if (Ctx == NULL) return EFI_DEVICE_ERROR;
+    Ctx->FileMFTIndex = NTFS_FILE_MFT;
+    NtfsEfiFreeAttrCtx (Vcb->MFTContext);
+    Vcb->MFTContext    = Ctx;
+    Vcb->MftDataOffset = DataOffset;
+    return EFI_SUCCESS;
+}
+
+/*
+ * Grow $MFT's own $BITMAP so it has a bit for every record the table now
+ * holds.
+ *
+ * On a small volume this attribute is resident and grows inside record 0. On
+ * any real Windows install it is not: a 136 000-record MFT needs about 17 KB
+ * of bits. The non-resident form is extended inside the clusters it already
+ * owns, and only when those run out is one more run allocated and appended.
+ * The bytes that newly fall inside the attribute are zeroed, because past the
+ * old data size the clusters hold whatever was there before, and a stale 1 bit
+ * would hand out a record that is already in use.
+ */
+static EFI_STATUS
+NtfsGrowMftBitmap (
+    IN     PNTFS_EFI_VCB       Vcb,
+    IN OUT PFILE_RECORD_HEADER MftRec0,
+    IN     ULONG               BmOffset,
+    IN     UINT64              OldLen,
+    IN     UINT64              NeedLen
+    )
+{
+    PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
+    EFI_STATUS        Status;
+
+    if (NeedLen <= OldLen) return EFI_SUCCESS;
+
+    if (!BmAttr->IsNonResident) {
+        if (!NtfsEfiGrowResidentInRecord (Vcb, MftRec0, BmOffset, NeedLen)) {
+            return NTFS_REFUSE (EFI_VOLUME_FULL);   /* record cannot hold more bits */
+        }
+        BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
+        ZeroMem ((PUCHAR)BmAttr + BmAttr->Resident.ValueOffset + OldLen,
+                 (UINTN)(NeedLen - OldLen));
+        return NtfsWriteMftRec0 (Vcb, MftRec0);
+    }
+
+    if (NeedLen > (UINT64)BmAttr->NonResident.AllocatedSize) {
+        UINT64 NeedClusters =
+            (NeedLen - (UINT64)BmAttr->NonResident.AllocatedSize +
+             Vcb->BytesPerCluster - 1) / Vcb->BytesPerCluster;
+        UINT64 StartLCN = 0, Got = 0;
+
+        Status = NtfsEfiAllocateClusters (Vcb, NeedClusters, &StartLCN, &Got);
+        if (EFI_ERROR (Status)) return Status;
+        if (Got < NeedClusters) {
+            if (Got) NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            return NTFS_REFUSE (EFI_VOLUME_FULL);
+        }
+        if (!NtfsAppendRunToAttr (Vcb, MftRec0, BmOffset, StartLCN, Got, 0)) {
+            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            return NTFS_REFUSE (EFI_OUT_OF_RESOURCES);   /* no room for another mapping pair */
+        }
+        BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
+    }
+
+    BmAttr->NonResident.DataSize        = (LONGLONG)NeedLen;
+    BmAttr->NonResident.InitializedSize = (LONGLONG)NeedLen;
+    Status = NtfsWriteMftRec0 (Vcb, MftRec0);
+    if (EFI_ERROR (Status)) return Status;
+
+    {
+        PNTFS_ATTR_CTX Fresh = NtfsEfiFindAttrInRecord (Vcb, MftRec0, AttributeBitmap, NULL, 0, NULL);
+        PUCHAR         Zeros;
+        UINT64         ZeroLen = NeedLen - OldLen;
+
+        if (Fresh == NULL) return EFI_DEVICE_ERROR;
+        Zeros = AllocateZeroPool ((UINTN)ZeroLen);
+        if (Zeros == NULL) {
+            NtfsEfiFreeAttrCtx (Fresh);
+            return EFI_OUT_OF_RESOURCES;
+        }
+        if (NtfsEfiWriteAttr (Vcb, Fresh, OldLen, (PCHAR)Zeros, (ULONG)ZeroLen) != (ULONG)ZeroLen) {
+            Status = EFI_DEVICE_ERROR;
+        }
+        FreePool (Zeros);
+        NtfsEfiFreeAttrCtx (Fresh);
+    }
+    return Status;
+}
+
+/* First clear bit in [NTFS_FILE_FIRST_USER_FILE, Limit), or FALSE when every
+ * one of them is taken. Records below NTFS_FILE_FIRST_USER_FILE belong to
+ * volume metadata even where their bit happens to read as free. */
+static BOOLEAN
+NtfsFirstFreeBit (
+    IN  CONST UCHAR *BmBuf,
+    IN  UINT64       Limit,
+    OUT UINT64      *FreeBit
+    )
+{
+    UINT64 Bit;
+
+    for (Bit = NTFS_FILE_FIRST_USER_FILE; Bit < Limit; Bit++) {
+        if (!((BmBuf[Bit / 8] >> (Bit % 8)) & 1)) {
+            *FreeBit = Bit;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/*
  * $MFT (record 0) has its own unnamed $BITMAP attribute tracking which MFT
- * record slots are in use - separate from the volume-wide $Bitmap (record
- * 6, cluster allocation) handled above. Same first-fit strategy. Records
- * below NTFS_FILE_FIRST_USER_FILE are reserved for system metadata even
- * if their bit happens to read as free on some volumes - never hand
- * those out.
+ * record slots are in use - separate from the volume-wide $Bitmap (record 6,
+ * cluster allocation) handled above.
+ *
+ * Two passes at most: look for a free record bit, and if there is none, grow
+ * the MFT (which appends fresh, all-zero records) and its bitmap, then look
+ * again. Record 0 is re-read at the top of each pass and after the growth, so
+ * no edit is ever made to a copy that NtfsGrowMft has since superseded.
  */
 EFI_STATUS
 NtfsEfiAllocateMftRecord (
@@ -291,166 +456,129 @@ NtfsEfiAllocateMftRecord (
     )
 {
     PFILE_RECORD_HEADER MftRec0;
-    ULONG                 BmOffset = 0;
-    PNTFS_ATTR_CTX        BmCtx;
-    UINT64                BmLen;
-    UINT64                MftRecordCount;
-    UINT64                Bit;
-    EFI_STATUS            Status;
-    BOOLEAN               Resident;
+    ULONG               BmOffset = 0;
+    PNTFS_ATTR_CTX      BmCtx;
+    UINT64              BmLen;
+    UINT64              MftRecordCount;
+    UINT64              Bit = 0;
+    UINT64              Limit;
+    EFI_STATUS          Status;
+    BOOLEAN             Resident;
+    BOOLEAN             Found;
+    UINTN               Attempt;
 
     *NewIndex = 0;
 
     MftRec0 = AllocatePool (Vcb->BytesPerFileRecord);
     if (MftRec0 == NULL) return EFI_OUT_OF_RESOURCES;
-    if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, NTFS_FILE_MFT, MftRec0))) {
-        FreePool (MftRec0);
-        return EFI_DEVICE_ERROR;
-    }
 
-    /*
-     * $MFT's own $BITMAP (record usage, 1 bit/record) is tiny on any
-     * volume with a modest record count and is commonly RESIDENT - unlike
-     * the volume-wide $Bitmap (record 6, cluster usage), which is always
-     * non-resident. NtfsEfiWriteAttr() refuses resident writes (they'd
-     * land in a disconnected heap copy, never reaching disk - see its
-     * comment in ntfs_attr.c), so the resident case is handled here by
-     * patching MftRec0's own attribute value in place and writing the
-     * whole record back, exactly like every other resident-attribute
-     * write in this driver.
-     */
-    BmCtx = NtfsEfiFindAttrInRecord (Vcb, MftRec0, AttributeBitmap, NULL, 0, &BmOffset);
-    if (BmCtx == NULL) {
-        FreePool (MftRec0);
-        return EFI_DEVICE_ERROR;
-    }
-    Resident = !BmCtx->pRecord->IsNonResident;
-    BmLen    = NtfsEfiAttrDataLength (BmCtx);
-
-    MftRecordCount = NtfsEfiAttrDataLength (Vcb->MFTContext) / Vcb->BytesPerFileRecord;
-    Status = EFI_VOLUME_FULL;
-
-    if (Resident) {
-        PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
-        PUCHAR            BmBuf  = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
-
-        for (Bit = NTFS_FILE_FIRST_USER_FILE; Bit < BmLen * 8 && Bit < MftRecordCount; Bit++) {
-            if (!((BmBuf[Bit / 8] >> (Bit % 8)) & 1)) {
-                BmBuf[Bit / 8] |= (UCHAR)(1U << (Bit % 8));
-                *NewIndex = Bit;
-                Status = EFI_SUCCESS;
-                break;
-            }
-        }
-    } else {
-        PUCHAR BmBuf = AllocatePool ((UINTN)BmLen);
-        if (BmBuf == NULL) {
-            NtfsEfiFreeAttrCtx (BmCtx);
+    for (Attempt = 0; Attempt < 2; Attempt++) {
+        if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, NTFS_FILE_MFT, MftRec0))) {
             FreePool (MftRec0);
-            return EFI_OUT_OF_RESOURCES;
-        }
-        NtfsEfiReadAttr (Vcb, BmCtx, 0, (PCHAR)BmBuf, (ULONG)BmLen);
-
-        for (Bit = NTFS_FILE_FIRST_USER_FILE; Bit < BmLen * 8 && Bit < MftRecordCount; Bit++) {
-            if (!((BmBuf[Bit / 8] >> (Bit % 8)) & 1)) {
-                BmBuf[Bit / 8] |= (UCHAR)(1U << (Bit % 8));
-                *NewIndex = Bit;
-                Status = EFI_SUCCESS;
-                break;
-            }
-        }
-        FreePool (BmBuf);
-    }
-
-    /* If we didn't find any free record bit in the existing table, let's grow it! */
-    if (Status == EFI_VOLUME_FULL) {
-        if (MftRecordCount >= BmLen * 8) {
-            ULONG NewBmLen = (ULONG)BmLen + 8;
-            if (Resident) {
-                if (!NtfsEfiGrowResidentInRecord (Vcb, MftRec0, BmOffset, NewBmLen)) {
-                    NtfsEfiFreeAttrCtx (BmCtx);
-                    FreePool (MftRec0);
-                    return EFI_VOLUME_FULL;
-                }
-                {
-                    PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
-                    PUCHAR BmBuf = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
-                    ZeroMem (BmBuf + BmLen, 8);
-                }
-                BmLen = NewBmLen;
-            } else {
-                NtfsEfiFreeAttrCtx (BmCtx);
-                FreePool (MftRec0);
-                return EFI_VOLUME_FULL;
-            }
+            return EFI_DEVICE_ERROR;
         }
 
-        Status = NtfsGrowMft (Vcb);
-        if (EFI_ERROR (Status)) {
-            NtfsEfiFreeAttrCtx (BmCtx);
+        /*
+         * NtfsEfiWriteAttr refuses resident writes - they would land in a
+         * disconnected heap copy and never reach disk, see its comment in
+         * ntfs_attr.c - so a resident bitmap is patched inside MftRec0's own
+         * attribute value and the whole record written back, exactly like
+         * every other resident-attribute write in this driver.
+         */
+        BmCtx = NtfsEfiFindAttrInRecord (Vcb, MftRec0, AttributeBitmap, NULL, 0, &BmOffset);
+        if (BmCtx == NULL) {
             FreePool (MftRec0);
-            return Status;
+            return EFI_DEVICE_ERROR;
         }
-
+        Resident       = !BmCtx->pRecord->IsNonResident;
+        BmLen          = NtfsEfiAttrDataLength (BmCtx);
         MftRecordCount = NtfsEfiAttrDataLength (Vcb->MFTContext) / Vcb->BytesPerFileRecord;
+        Limit          = (BmLen * 8 < MftRecordCount) ? BmLen * 8 : MftRecordCount;
 
         if (Resident) {
             PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
             PUCHAR            BmBuf  = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
 
-            for (Bit = NTFS_FILE_FIRST_USER_FILE; Bit < BmLen * 8 && Bit < MftRecordCount; Bit++) {
-                if (!((BmBuf[Bit / 8] >> (Bit % 8)) & 1)) {
-                    BmBuf[Bit / 8] |= (UCHAR)(1U << (Bit % 8));
-                    *NewIndex = Bit;
-                    Status = EFI_SUCCESS;
-                    break;
-                }
+            Found = NtfsFirstFreeBit (BmBuf, Limit, &Bit);
+            NtfsEfiFreeAttrCtx (BmCtx);
+            if (Found) {
+                BmBuf[Bit / 8] |= (UCHAR)(1U << (Bit % 8));
+                Status = NtfsWriteMftRec0 (Vcb, MftRec0);
+                if (!EFI_ERROR (Status)) *NewIndex = Bit;
+                FreePool (MftRec0);
+                return Status;
             }
         } else {
             PUCHAR BmBuf = AllocatePool ((UINTN)BmLen);
+
             if (BmBuf == NULL) {
                 NtfsEfiFreeAttrCtx (BmCtx);
                 FreePool (MftRec0);
                 return EFI_OUT_OF_RESOURCES;
             }
-            NtfsEfiReadAttr (Vcb, BmCtx, 0, (PCHAR)BmBuf, (ULONG)BmLen);
-
-            for (Bit = NTFS_FILE_FIRST_USER_FILE; Bit < BmLen * 8 && Bit < MftRecordCount; Bit++) {
-                if (!((BmBuf[Bit / 8] >> (Bit % 8)) & 1)) {
-                    BmBuf[Bit / 8] |= (UCHAR)(1U << (Bit % 8));
-                    *NewIndex = Bit;
-                    Status = EFI_SUCCESS;
-                    break;
-                }
+            if (NtfsEfiReadAttr (Vcb, BmCtx, 0, (PCHAR)BmBuf, (ULONG)BmLen) != (ULONG)BmLen) {
+                FreePool (BmBuf);
+                NtfsEfiFreeAttrCtx (BmCtx);
+                FreePool (MftRec0);
+                return EFI_VOLUME_CORRUPTED;
             }
+            Found = NtfsFirstFreeBit (BmBuf, Limit, &Bit);
             FreePool (BmBuf);
-        }
-    }
+            if (Found) {
+                UCHAR Byte = 0;
 
-    /* Save the modified MFT Record 0 if we made a change */
-    if (!EFI_ERROR (Status)) {
-        if (Resident) {
-            Status = NtfsEfiWriteFileRecord (Vcb, NTFS_FILE_MFT, MftRec0);
-        } else {
-            // Non-resident bit was set, write the specific byte
-            UCHAR Byte = 0;
-            /* Re-find the attribute: the record may have been rewritten (MFT
-             * growth) since BmCtx was built, so its cached copy can be stale. */
-            PNTFS_ATTR_CTX FreshBmCtx = NtfsEfiFindAttrInRecord (Vcb, MftRec0, AttributeBitmap, NULL, 0, NULL);
-            if (FreshBmCtx != NULL) {
-                NtfsEfiReadAttr (Vcb, FreshBmCtx, *NewIndex / 8, (PCHAR)&Byte, 1);
-                Byte |= (UCHAR)(1U << (*NewIndex % 8));
-                NtfsEfiWriteAttr (Vcb, FreshBmCtx, *NewIndex / 8, (PCHAR)&Byte, 1);
-                NtfsEfiFreeAttrCtx (FreshBmCtx);
-            } else {
-                Status = EFI_DEVICE_ERROR;
+                if (NtfsEfiReadAttr (Vcb, BmCtx, Bit / 8, (PCHAR)&Byte, 1) != 1) {
+                    NtfsEfiFreeAttrCtx (BmCtx);
+                    FreePool (MftRec0);
+                    return EFI_VOLUME_CORRUPTED;
+                }
+                Byte |= (UCHAR)(1U << (Bit % 8));
+                Status = (NtfsEfiWriteAttr (Vcb, BmCtx, Bit / 8, (PCHAR)&Byte, 1) == 1)
+                             ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+                NtfsEfiFreeAttrCtx (BmCtx);
+                if (!EFI_ERROR (Status)) *NewIndex = Bit;
+                FreePool (MftRec0);
+                return Status;
+            }
+            NtfsEfiFreeAttrCtx (BmCtx);
+        }
+
+        if (Attempt > 0) break;     /* grew once already and still nothing */
+
+        Status = NtfsGrowMft (Vcb);
+        if (EFI_ERROR (Status)) {
+            FreePool (MftRec0);
+            return Status;
+        }
+
+        /* NtfsGrowMft rewrote record 0 from the VCB's copy: re-read it before
+         * touching the bitmap, or the growth would be thrown away. */
+        if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, NTFS_FILE_MFT, MftRec0))) {
+            FreePool (MftRec0);
+            return EFI_DEVICE_ERROR;
+        }
+        BmCtx = NtfsEfiFindAttrInRecord (Vcb, MftRec0, AttributeBitmap, NULL, 0, &BmOffset);
+        if (BmCtx == NULL) {
+            FreePool (MftRec0);
+            return EFI_DEVICE_ERROR;
+        }
+        BmLen          = NtfsEfiAttrDataLength (BmCtx);
+        MftRecordCount = NtfsEfiAttrDataLength (Vcb->MFTContext) / Vcb->BytesPerFileRecord;
+        NtfsEfiFreeAttrCtx (BmCtx);
+
+        if (MftRecordCount > BmLen * 8) {
+            UINT64 NeedLen = ROUND_UP ((MftRecordCount + 7) / 8, 8);
+
+            Status = NtfsGrowMftBitmap (Vcb, MftRec0, BmOffset, BmLen, NeedLen);
+            if (EFI_ERROR (Status)) {
+                FreePool (MftRec0);
+                return Status;
             }
         }
     }
 
-    NtfsEfiFreeAttrCtx (BmCtx);
     FreePool (MftRec0);
-    return Status;
+    return NTFS_REFUSE (EFI_VOLUME_FULL);
 }
 
 EFI_STATUS
@@ -489,7 +617,7 @@ NtfsEfiFreeMftRecord (
         }
         BmBuf[Index / 8] &= (UCHAR)~(1U << (Index % 8));
         NtfsEfiFreeAttrCtx (BmCtx);
-        Status = NtfsEfiWriteFileRecord (Vcb, NTFS_FILE_MFT, MftRec0);
+        Status = NtfsWriteMftRec0 (Vcb, MftRec0);
     } else {
         UCHAR Byte;
         NtfsEfiReadAttr (Vcb, BmCtx, Index / 8, (PCHAR)&Byte, 1);
