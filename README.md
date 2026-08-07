@@ -585,6 +585,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Mixed mutation pass | Create, grow, rename, cross-directory move and delete in a single run | `chkdsk` CLEAN, volume NOT dirty |
 | Same-volume EC copy and directory refill, Hyper-V | 550 files from Windows 11 `System32\drivers`, including WOF files and hard links, copied to another directory on the same NTFS volume; destination then emptied with `delete *` and filled again | 550/550 SHA256 byte-exact after refill, 0 missing, 0 mismatches, 0 extras, `chkdsk /f` CLEAN, volume NOT dirty |
 | Large copy, Hyper-V | 7 GB of mixed data, FAT source to NTFS target, ~4 minutes | `bad=0`, `chkdsk` CLEAN, volume NOT dirty |
+| `SetInfo` grow of a resident file, Hyper-V | `FileSize` raised from 10 bytes to 5000 on a still-resident file — forces resident-to-non-resident promotion plus zero-fill | New size and the original prefix both read back, `chkdsk` CLEAN |
 | Collation beyond a-z, Hyper-V | Cyrillic capital Ya then small a created in a fresh (still resident-index) directory, then both reopened | `chkdsk` CLEAN — the same test against the previous build reports `Index $I30 ... is incorrectly sorted` |
 | Same-filesystem 92 MB copy, Hyper-V | `samefs_src.bin` copied to `samefs_dst.bin` on the same NTFS volume — non-resident growth across many runs within one file | SHA256 byte-exact, `chkdsk` CLEAN |
 
@@ -619,7 +620,6 @@ Stated plainly, because each one is a deliberate boundary rather than an oversig
 7. **2048 extents per attribute.** Enough for any realistic file given run merging, but a pathologically fragmented attribute is rejected instead of truncated.
 8. **Automated coverage is uneven.** Create, write, delete, rename, move, `SetInfo`, B+tree splits and the copy paths are covered by the harness. The LZNT1, symlink and 8.3 short-name read paths are implemented but not yet fixtured for every edge case.
 9. **Little-endian x64 only.** On-disk structures are raw struct overlays; a big-endian target would need byte-swapping accessors.
-10. **`SetInfo` cannot grow a resident file.** Setting a larger `FileSize` on a small, still-resident file returns `EFI_DEVICE_ERROR` and leaves the size unchanged; growing the same file by writing to it works normally. Under investigation.
 
 ---
 

@@ -1119,22 +1119,55 @@ NtfsConvertResidentDataToNonResident (
         }
     }
 
-    if (OldValueLength != 0) {
+    /*
+     * Lay down the preserved value and the caller's payload in ONE write that
+     * starts on the cluster boundary and covers whole clusters.
+     *
+     * This used to be two writes: OldValue at the cluster start, then the
+     * payload at StartLCN * BytesPerCluster + WriteOffset. That second offset is
+     * not sector-aligned (WriteOffset is the old file size - 10 bytes in the
+     * SetInfo-grow case), and the write spanned a cluster boundary from there.
+     * Hyper-V's DiskIo failed it with EFI_DEVICE_ERROR, which surfaced as
+     * SetInfo refusing to grow a still-resident file while the zero-fill of the
+     * same clusters - issued in aligned 64 KiB chunks - had just succeeded.
+     * Composing the head in memory removes the unaligned write entirely, and
+     * costs one buffer that is at most the prealloc quantum.
+     *
+     * The region [0, WriteOffset) that the payload does not cover is the old
+     * value plus, if the caller is writing past it, a gap that must read as
+     * zero - the buffer is zero-allocated, so both cases fall out for free.
+     */
+    {
+        UINT64 HeadBytes  = WriteOffset + (UINT64)WriteLength;
+        UINTN  HeadRounded;
+        PUCHAR Head;
+
+        if (HeadBytes > AllocBytes) {            /* caller asked past the allocation */
+            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            if (OldValue) FreePool (OldValue);
+            return EFI_INVALID_PARAMETER;
+        }
+        HeadRounded = (UINTN)ROUND_UP (HeadBytes, Vcb->BytesPerCluster);
+        Head = AllocateZeroPool (HeadRounded);
+        if (Head == NULL) {
+            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            if (OldValue) FreePool (OldValue);
+            return EFI_OUT_OF_RESOURCES;
+        }
+        if (OldValueLength != 0) {
+            UINTN Keep = (UINTN)min (OldValueLength, WriteOffset);
+            CopyMem (Head, OldValue, Keep);
+        }
+        CopyMem (Head + WriteOffset, WriteBuffer, WriteLength);
+
         Status = NtfsEfiWriteDisk (Vcb, StartLCN * Vcb->BytesPerCluster,
-                                   (UINTN)OldValueLength, OldValue);
+                                   HeadRounded, Head);
+        FreePool (Head);
         if (EFI_ERROR (Status)) {
             NtfsEfiFreeClusters (Vcb, StartLCN, Got);
             if (OldValue) FreePool (OldValue);
             return Status;
         }
-    }
-
-    Status = NtfsEfiWriteDisk (Vcb, StartLCN * Vcb->BytesPerCluster + WriteOffset,
-                               WriteLength, WriteBuffer);
-    if (EFI_ERROR (Status)) {
-        NtfsEfiFreeClusters (Vcb, StartLCN, Got);
-        if (OldValue) FreePool (OldValue);
-        return Status;
     }
 
     NextAttr = (PUCHAR)Attr + OldAttrLen;
