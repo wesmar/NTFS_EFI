@@ -166,7 +166,7 @@ flowchart TB
 |---|---|
 | Resident `$DATA` | Read straight out of the fixed-up MFT record, no block I/O |
 | Non-resident `$DATA` | Mapping pairs decoded once into a flat `NTFS_RUN_ENTRY` array (up to 2048 extents per attribute); multi-extent reads served from it |
-| Sparse runs | Detected from the run's own offset-size nibble (`OffBytes == 0`), not from an LCN delta sentinel — a real fragment starting one cluster before its predecessor used to be misread as a hole |
+| Sparse runs | Detected from the run's own offset-size nibble (`OffBytes == 0`). An LCN delta of zero is a legitimate fragment placement, so it is never treated as a hole |
 | LZNT1-compressed `$DATA` | Full decompressor ported from the NT source (`RtlDecompressBufferLZNT1`); handles the "stored uncompressed" unit form and the compressed-run-plus-hole form |
 | WOF-backed files | Reads `WofCompressedData` and decodes XPRESS4K, XPRESS8K and XPRESS16K chunks; unsupported providers and algorithms fail closed |
 | EFS streams | Refused with `EFI_UNSUPPORTED` rather than returning zeros |
@@ -176,7 +176,7 @@ flowchart TB
 | Reparse points | `$REPARSE_POINT` symlink resolver for `\??\`, drive-letter and relative targets (MS-FSCC layout) |
 | Volume metadata | Label from `$Volume`, free clusters from `$Bitmap`, both returned via `EFI_FILE_SYSTEM_INFO` |
 
-Case folding uses the volume's own 65536-entry `$UpCase` table — the same table `chkdsk` and NTFS.sys collate with — so international names match exactly as Windows matches them, Polish `Ą Ć Ę Ł Ń Ó Ś Ź Ż` included. If `$UpCase` cannot be read the mount falls back to an ASCII identity table instead of dereferencing NULL. Every insert and every lookup goes through that one table — including the resident-`$INDEX_ROOT` insert, which until recently folded only `a`-`z` by hand and could therefore file a Cyrillic or Greek name in the wrong slot.
+Case folding uses the volume's own 65536-entry `$UpCase` table, the same table `chkdsk` and NTFS.sys collate with, so international names match the way Windows matches them, Polish `Ą Ć Ę Ł Ń Ó Ś Ź Ż` included. Every insert and every lookup goes through that one table, including the resident-`$INDEX_ROOT` insert, so a name is filed in the slot the next lookup will search. If `$UpCase` cannot be read the mount falls back to an ASCII identity table.
 
 ---
 
@@ -193,11 +193,11 @@ Case folding uses the volume's own 65536-entry `$UpCase` table — the same tabl
 | **SetInfo** attributes | DOS `ReadOnly`, `Hidden`, `System`, `Archive` written to all three of those locations |
 | **SetInfo** file size | `NtfsEfiSetFileSize` shrinks resident and non-resident data; growth goes through the seek-write-past-EOF path |
 | **Close** | `NtfsEfiTrimAllocation` releases preallocation slack back to `$Bitmap` |
-| **`$MFT` growth** | `NtfsGrowMft` appends a zeroed 16-cluster chunk as a merged run; the resident `$MFT:$BITMAP` grows 8 bytes (64 records) per chunk |
+| **`$MFT` growth** | `NtfsGrowMft` appends a zeroed 16-cluster chunk as a merged run; a resident `$MFT:$BITMAP` grows 8 bytes (64 records) per chunk |
 | **`$MFTMirr`** | Every write to MFT records 0-3 is mirrored in lock-step |
 | **Unmount** | Preallocation trimmed, `$Volume` dirty flag cleared, `BlockIo->FlushBlocks` issued |
 
-The 72-byte `$STANDARD_INFORMATION` form is not optional. A file written with the shorter pre-NT4 form, or with `SecurityId == 0`, has no valid reference into the volume-wide `$Secure` store, and NTFS.sys treats it as corrupt — a lesson the code comments record in full.
+The driver always writes the 72-byte `$STANDARD_INFORMATION` form. The shorter pre-NT4 form, and a `SecurityId` of zero, leave the record without a valid reference into the volume-wide `$Secure` store, and NTFS.sys reports such a file as corrupt.
 
 ```mermaid
 sequenceDiagram
@@ -238,7 +238,7 @@ sequenceDiagram
 
 ## B+Tree Index Engine
 
-An NTFS directory is a collation-sorted B+tree. Small directories keep every entry in the resident `$INDEX_ROOT` attribute inside the directory's own MFT record; once that overflows, entries move into non-resident `INDX` blocks addressed by `$INDEX_ALLOCATION`. Both directions have to work, in both senses, or `chkdsk` will find it.
+An NTFS directory is a collation-sorted B+tree. Small directories keep every entry in the resident `$INDEX_ROOT` attribute inside the directory's own MFT record; once that overflows, entries move into non-resident `INDX` blocks addressed by `$INDEX_ALLOCATION`. The driver implements both directions of that transition and both directions of the tree's growth, which is what keeps a volume `chkdsk`-clean after heavy directory mutation.
 
 ```mermaid
 flowchart TD
@@ -266,19 +266,20 @@ flowchart TD
 
 Node operations, in the order the code performs them:
 
-1. **Directed descent for `Open()`.** `NtfsEfiSearchIndexBlock` / `NtfsEfiSearchSubNode` compare the search key against the sorted entries of a node and descend into exactly one child — `O(log n)`. The exhaustive walk (`NtfsEfiScanIndexBlock` / `NtfsEfiBrowseSubNode`) is kept only for full enumeration, where visiting everything is inherent. On a real `\Windows\System32` with thousands of entries the exhaustive variant was unusable for lookups; this is the split that fixed it.
-2. **Root overflow.** `NtfsConvertRootToSingleIndexAllocation` and `NtfsBtreePushDownRoot` move the resident entries into the first `INDX` leaf — and only when the root actually holds real entries, which is what prevents an infinite push-down loop. Attribute contexts are re-decoded afterwards, because the attribute offset inside the record has shifted.
-3. **Leaf and internal splits.** `NtfsBtreeInsertRec` descends recursively, splits a full block, builds the separator (`NtfsMakeSeparator`) and inserts it into the parent (`NtfsRootInsertSep`), propagating upward as far as needed.
-4. **Rebalance on delete.** Deleting a leaf entry is an unlink. Deleting a separator key that owns a subtree promotes the in-order predecessor out of the left subtree (`NtfsExtractMaxKey`, recursion depth capped at 32); an empty subtree just drops the separator. The operation is refused with `EFI_UNSUPPORTED` only when the replacement key would not fit in the host block.
-5. **Collapse.** When deletions bring a directory back within the MFT record's free space, `NtfsCollapseIndexToResident` frees the `INDX` clusters in `$Bitmap` and folds the index back into a resident-only `$INDEX_ROOT` — the inverse of step 2, and the part most implementations skip.
-6. **Two records for one index.** Windows routinely leaves `$INDEX_ROOT` in the directory's base record and moves `$INDEX_ALLOCATION` + `$BITMAP:$I30` into an `$ATTRIBUTE_LIST` extension record. `NtfsEfiResolveIndexHost` resolves both hosts and hands the insert, the delete and the collapse each the record its own edits belong in, writing every record back under the MFT index the resolver reports — never the record's own `MFTRecordNumber` field, which is untrusted on-disk data. Treating one record as both hosts would silently drop half of every operation.
-7. **The END entry is an entry, not a boundary.** A node's rightmost child pointer lives in its `END` entry; `Header + TotalSizeOfEntries` is the byte *after* it. Reading the child VCN at the boundary instead of at the entry picks up whatever slack follows the last entry, and an internal split then stamps those bytes into the new node as its child pointer — after which the entire subtree below it, plus every entry already in it, becomes unreachable while the creates still report success. Both split paths read it from the entry.
+1. **Directed descent for `Open()`.** `NtfsEfiSearchIndexBlock` and `NtfsEfiSearchSubNode` compare the search key against the sorted entries of a node and descend into exactly one child, `O(log n)` in the number of entries. The exhaustive walk (`NtfsEfiScanIndexBlock`, `NtfsEfiBrowseSubNode`) serves full enumeration, where every entry has to be visited anyway.
+2. **Root overflow.** `NtfsConvertRootToSingleIndexAllocation` and `NtfsBtreePushDownRoot` move the resident entries into the first `INDX` leaf. A push-down runs only while the root still holds real entries, so a root already reduced to its `END` pointer cannot stack further empty levels. Attribute contexts are re-decoded afterwards, since the attribute offset inside the record has shifted.
+3. **Leaf and internal splits.** `NtfsBtreeInsertRec` descends recursively, splits a full block, builds the separator (`NtfsMakeSeparator`) and inserts it into the parent (`NtfsRootInsertSep`), propagating upward as far as needed. Split blocks are queued and written only after the record they hang off is on disk, so a failed insert leaves no block that nothing points at.
+4. **Rebalance on delete.** Deleting a leaf entry is an unlink. Deleting a separator key that owns a subtree promotes the in-order predecessor out of the left subtree (`NtfsExtractMaxKey`, recursion depth capped at 32); an empty subtree drops the separator. The operation is refused with `EFI_UNSUPPORTED` when the replacement key would not fit in the host block.
+5. **Collapse.** When deletions bring a directory back within the MFT record's free space, `NtfsCollapseIndexToResident` frees the `INDX` clusters in `$Bitmap` and folds the index back into a resident-only `$INDEX_ROOT`, the inverse of step 2.
+6. **Two records for one index.** Windows routinely leaves `$INDEX_ROOT` in the directory's base record and moves `$INDEX_ALLOCATION` and `$BITMAP:$I30` into an `$ATTRIBUTE_LIST` extension record. `NtfsEfiResolveIndexHost` resolves both hosts, and the insert, the delete and the collapse each edit the record their own attributes live in. Every record is written back under the MFT index the resolver reports; the record's own `MFTRecordNumber` field is on-disk data and is never used for that.
+7. **Block allocation for the index.** `NtfsBtreeAllocBlock` first hands out a block the directory already owns and has free, which needs no new mapping pair; the driver's delete-all keeps the mapping while clearing the `$BITMAP:$I30` bits, so such blocks are common. Fresh clusters are taken 8 blocks to a run, with a fallback through 4, 2 and 1 when the volume cannot place them contiguously. The mapping pairs live in the directory's own MFT record, so keeping their number down is what sets the practical ceiling on entries per directory.
+8. **Rightmost child pointers.** A node's rightmost child VCN lives inside its `END` entry, while `Header + TotalSizeOfEntries` addresses the byte after that entry. Both split paths read the pointer from the entry, and a node flagged `NODE` whose `END` entry is too short to hold a VCN is rejected as corrupt.
 
 ---
 
 ## Performance Engineering
 
-Correct NTFS writing is achievable with naive I/O; fast NTFS writing is not. Each mechanism below replaced a measured bottleneck, not a suspected one — the driver keeps deterministic counters (`gNtfsReadBytes`, `gNtfsWriteBytes`, `gNtfsRecordReads`) instead of trusting wall-clock timings on a loaded QEMU host.
+Every mechanism below was chosen against a measurement. The driver keeps deterministic counters (`gNtfsReadBytes`, `gNtfsWriteBytes`, `gNtfsRecordReads`), which give repeatable numbers where wall-clock timings on a loaded QEMU host do not.
 
 | Mechanism | Problem it removed |
 |---|---|
@@ -298,7 +299,7 @@ Measured end to end: **7 GB of mixed real data copied from a FAT source to NTFS 
 
 ## On-Disk Structures
 
-`src/ntfs.h` defines every physical NTFS structure the driver touches, with no WDM, ReactOS or ntfs-3g headers behind it. Layouts are raw struct overlays on little-endian x64 — deliberately, and documented as such.
+`src/ntfs.h` defines every physical NTFS structure the driver touches, with no WDM, ReactOS or ntfs-3g headers behind it. Layouts are raw struct overlays valid on little-endian x64.
 
 ### Boot sector
 
@@ -365,7 +366,7 @@ typedef struct {
 } FILE_RECORD_HEADER, *PFILE_RECORD_HEADER;
 ```
 
-Every record read applies the update sequence array fixup and every record write un-applies it (`ntfs_mft.c`); a record whose USN does not match its per-sector copies is rejected as corrupt rather than parsed. `UsaOffset` and `UsaCount` are bounds-checked against the record size the type implies before either direction runs — both loops rewrite the last two bytes of every sector-sized chunk, so an out-of-range count would write past the buffer rather than merely read past it.
+Every record read applies the update sequence array fixup and every record write un-applies it (`ntfs_mft.c`); a record whose USN does not match its per-sector copies is rejected as corrupt rather than parsed. `UsaOffset` and `UsaCount` are bounds-checked against the record size the type implies before either direction runs — both loops rewrite the last two bytes of every sector-sized chunk, so an out-of-range count would write outside the buffer.
 
 ### Attribute record
 
@@ -464,7 +465,7 @@ NTFS_EFI/
 └── build.ps1                 # Finds MSBuild via vswhere, builds all three, packs the release
 ```
 
-Weight sits where the hard problems are: `ntfs_create.c` and `ntfs_delete.c` together are the B+tree engine, `ntfs_file.c` carries the whole protocol surface plus non-resident growth, and `ntfs_bitmap.c` holds the allocator that decides how fast a copy runs.
+The bulk of the code sits in four files: `ntfs_create.c` and `ntfs_delete.c` are the B+tree engine, `ntfs_file.c` carries the protocol surface and non-resident growth, and `ntfs_bitmap.c` holds the allocator that sets copy throughput.
 
 ---
 
@@ -540,7 +541,7 @@ Loaded from the application directory, then the volume root, then `\EFI\BOOT\EC.
 2. Run the inline unit tests: create, write, read back, seek-write past EOF, rename, cross-directory move, `SetInfo` timestamps and attributes, resize, delete.
 3. Copy a directory tree recursively from the ESP source to the NTFS target, preserving names, sizes and timestamps.
 4. Checkpoint progress into `\_PROG.txt` every 200 files, so an unexpected reboot still shows how far the run got.
-5. Write `\_RESULT.txt` with file and byte counts, the error summary and the verdict string.
+5. Write `\_RESULT.txt` with file and byte counts, the error summary and the verdict string, and append every line of the run to `\_PROBE_TRACE.txt` on the ESP, which the host can read without mounting the NTFS volume at all.
 6. `DisconnectController` on every NTFS handle to force `BindingStop` — prealloc trim, dirty-flag clear, `FlushBlocks`.
 7. `ResetSystem(EfiResetShutdown)`, so the host can attach the VHD read-only before Windows can touch it.
 
@@ -590,7 +591,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | `SetInfo` grow of a resident file, Hyper-V | `FileSize` raised from 10 bytes to 5000 on a still-resident file — forces resident-to-non-resident promotion plus zero-fill | New size and the original prefix both read back, `chkdsk` CLEAN |
 | Collation beyond a-z, Hyper-V | Cyrillic capital Ya then small a created in a fresh (still resident-index) directory, then both reopened | `chkdsk` CLEAN — the same test against the previous build reports `Index $I30 ... is incorrectly sorted` |
 | Same-filesystem 92 MB copy, Hyper-V | `samefs_src.bin` copied to `samefs_dst.bin` on the same NTFS volume — non-resident growth across many runs within one file | SHA256 byte-exact, `chkdsk` CLEAN |
-| `CatRoot` copy on a live Windows 11 install, Hyper-V | `\Windows\System32\CatRoot` (1854 catalog files, names up to 136 chars, 28 MB) copied into one directory on the same 63 GB NTFS volume | **1854 of 1854 created, all 1854 visible to Windows, 0 refusals, 0 orphans**, `chkdsk` reports *found no problems*, every allocated `INDX` block reachable from the root. The index needed 249 blocks and its mapping pairs fit in 216 of the record's ~1024 bytes. Earlier builds: 987 created with 867 refusals once the mapping pairs filled the record, and before the END-entry fix 964 created with **0** visible and 964 orphans recovered by `chkdsk` |
+| `CatRoot` copy on a live Windows 11 install, Hyper-V | `\Windows\System32\CatRoot` (1854 catalog files, names up to 136 chars, 28 MB) copied into one directory on the same 63 GB NTFS volume | **1854 of 1854 created, all 1854 visible to Windows, 0 refusals, 0 orphans**, `chkdsk` reports *found no problems*, every allocated `INDX` block reachable from the root. The index needed 249 blocks, with mapping pairs occupying 216 of the record's ~1024 bytes |
 | Fill / empty / refill, Hyper-V | `\Windows\System32\drivers` (548 files) copied into one directory three times, with every file deleted between passes — the state a copy target used over and over ends up in | 548 of 548 every pass, zero refusals, index attribute settling at 4 runs in 104 bytes (25 blocks owned, 20 in use, 5 spare and reachable), `chkdsk` CLEAN |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
@@ -613,7 +614,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 
 ## Known Limitations
 
-Stated plainly, because each one is a deliberate boundary rather than an oversight:
+Each of these is a boundary the code refuses at, with the operation left unchanged:
 
 1. **No DOS 8.3 alias.** Files are created with a single POSIX `$FILE_NAME`. Windows handles them normally; very old tools that expect a short name will not see one.
 2. **Write path assumes a single base MFT record.** `$ATTRIBUTE_LIST` is followed on read — and an index whose `$INDEX_ROOT` and `$INDEX_ALLOCATION` were relocated into *different* records is written correctly — but the driver never creates extension records itself. So a file whose attributes would overflow its 1 KB record cannot be written, and a directory keeps accepting new entries only while `$INDEX_ALLOCATION`'s mapping pairs still fit in that record. Index blocks are allocated 8 to a run and unused owned blocks are reused, which keeps that cost low — 1854 long-named entries in one directory need 249 blocks described in 216 bytes — but the budget is finite. When it runs out the insert returns `EFI_UNSUPPORTED` with nothing modified, and every entry already there stays intact and visible.
@@ -622,6 +623,7 @@ Stated plainly, because each one is a deliberate boundary rather than an oversig
 5. **No compression on write.** LZNT1 and WOF/XPRESS are decompress-only; compressed attributes are read, never rewritten.
 6. **Separator-key deletion can still be refused.** Rebalancing handles the normal cases; the rare replacement key that would overflow the host block returns `EFI_UNSUPPORTED` rather than restructuring further.
 7. **2048 extents per attribute.** Enough for any realistic file given run merging, but a pathologically fragmented attribute is rejected instead of truncated.
+8. **A non-resident `$MFT:$BITMAP` is read, not grown.** `NtfsGrowMft` extends `$MFT` itself and grows a resident record bitmap in place. On a volume whose bitmap has gone non-resident, a request that needs a record beyond the bits it already holds returns `EFI_VOLUME_FULL` even with free space on the volume. Existing free record slots are used normally, so this only surfaces on a volume with no reusable slot left.
 8. **Automated coverage is uneven.** Create, write, delete, rename, move, `SetInfo`, B+tree splits and the copy paths are covered by the harness. The LZNT1, symlink and 8.3 short-name read paths are implemented but not yet fixtured for every edge case.
 9. **Little-endian x64 only.** On-disk structures are raw struct overlays; a big-endian target would need byte-swapping accessors.
 
@@ -757,7 +759,7 @@ The driver and the probe build at `/W4 /WX` — warning-free, with warnings prom
 
 ### Diagnostic refusal codes
 
-A dozen separate limits in the write path all refuse the same way — `EFI_UNSUPPORTED`, nothing modified — which is exactly what an application should see and exactly what tells you nothing when you are the one debugging it. A UEFI driver has no log to read afterwards, so each of those sites names its own distinct status through one macro:
+A dozen separate limits in the write path all refuse the same way, with `EFI_UNSUPPORTED` and nothing modified. That is the right status for an application, and it does not say which limit was reached. A UEFI driver has no log to consult afterwards, so each of those sites names its own distinct status through one macro:
 
 ```c
 return NTFS_REFUSE (EFI_NO_MEDIA);   /* no record room for another mapping pair */
@@ -768,7 +770,7 @@ return NTFS_REFUSE (EFI_NO_MEDIA);   /* no record room for another mapping pair 
 .\build.ps1 -Diag    # diagnostic: each site returns its own status, printed by %r
 ```
 
-In a production build the argument is discarded by the preprocessor, so the generated code is identical to a plain `return EFI_UNSUPPORTED;` — verified by hash: the release binary is byte-for-byte the same with the mechanism in place as without it. One `-Diag` run then names the boundary that refused, with no bisecting rebuilds and nothing left behind in the tree. The codes are picked from statuses the driver never returns for real (`EFI_NO_MEDIA`, `EFI_TIMEOUT`, …), so a diagnostic run can never be mistaken for a genuine failure — and no caller may test for them: outside a `-Diag` build they do not exist.
+In a production build the preprocessor discards the argument, so the generated code matches a plain `return EFI_UNSUPPORTED;`. Verified by hash: the release binary is byte-for-byte the same with the mechanism in place as without it. One `-Diag` run names the boundary that refused. The codes come from statuses the driver never returns for real (`EFI_NO_MEDIA`, `EFI_TIMEOUT` and similar), so a diagnostic run cannot be confused with a genuine failure. No caller may test for them, since outside a `-Diag` build they do not exist.
 
 ---
 
