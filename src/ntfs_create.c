@@ -429,6 +429,15 @@ NtfsBtreeAllocBlock (
     IN OUT PFILE_RECORD_HEADER DirRec,
     IN     ULONG                AllocOffset,
     IN OUT INT64               *LastRealLCN,
+    /*
+     * The context the caller READS index blocks through. Its run list was
+     * decoded when the context was built, so appending a run to the record
+     * below leaves it one run short: a later read of the block just allocated
+     * lands past the end of the mapping and comes back short, which the caller
+     * can only report as a corrupt volume. Keep the decoded list in step here.
+     * NULL when the caller refreshes the context itself afterwards.
+     */
+    IN OUT PNTFS_ATTR_CTX      AllocCtx OPTIONAL,
     OUT    UINT64              *NewVCN,
     OUT    INT64               *NewLcn
     )
@@ -455,6 +464,40 @@ NtfsBtreeAllocBlock (
     AllocAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + AllocOffset);   /* stable: before $BITMAP */
     AllocAttr->NonResident.DataSize        = (LONGLONG)((*NewVCN + 1) * Vcb->BytesPerIndexRecord);
     AllocAttr->NonResident.InitializedSize = AllocAttr->NonResident.DataSize;
+
+    /*
+     * Mirror the new extent into the caller's decoded run list, matching what
+     * NtfsAppendRunToAttr just did to the record: merge into the tail run when
+     * physically contiguous, otherwise append. Without this the very next
+     * NtfsEfiReadAttr for this VCN returns short, and the B+tree insert reports
+     * EFI_VOLUME_CORRUPTED on a perfectly good volume - which is what a real
+     * \Windows\System32 copy hit after ~1750 files, once a directory of
+     * long-named entries needed a second block inside one insert.
+     */
+    if (AllocCtx != NULL) {
+        ULONG rc = AllocCtx->RunCount;
+        if (rc > 0 && AllocCtx->Runs[rc - 1].LBN != -1LL &&
+            (UINT64)(AllocCtx->Runs[rc - 1].LBN + AllocCtx->Runs[rc - 1].Len) == StartLCN) {
+            AllocCtx->Runs[rc - 1].Len += ClustersPer;
+        } else if (rc < NTFS_MAX_RUNS) {
+            UINT64 NextVBN = (rc > 0)
+                ? (AllocCtx->Runs[rc - 1].VBN + AllocCtx->Runs[rc - 1].Len)
+                : 0;
+            AllocCtx->Runs[rc].VBN = NextVBN;
+            AllocCtx->Runs[rc].LBN = (INT64)StartLCN;
+            AllocCtx->Runs[rc].Len = ClustersPer;
+            AllocCtx->RunCount     = rc + 1;
+        } else {
+            NtfsEfiFreeClusters (Vcb, StartLCN, Got);
+            return EFI_UNSUPPORTED;   /* run list full - refuse, do not read short */
+        }
+        /* the context's own copy of the attribute header must agree, since
+         * NtfsEfiAttrDataLength and the read path both consult it */
+        AllocCtx->pRecord->NonResident.HighestVCN      = (LONGLONG)(*NewVCN + ClustersPer - 1);
+        AllocCtx->pRecord->NonResident.DataSize        = AllocAttr->NonResident.DataSize;
+        AllocCtx->pRecord->NonResident.InitializedSize = AllocAttr->NonResident.InitializedSize;
+        AllocCtx->pRecord->NonResident.AllocatedSize   = AllocAttr->NonResident.AllocatedSize;
+    }
 
     /* the append shifted $BITMAP forward - re-find it */
     BmProbe = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap, L"$I30", 4, &BmOff);
@@ -544,6 +587,54 @@ NtfsMakeSeparator (
     return SepLen;
 }
 
+typedef struct {
+    PUCHAR Buf;
+    INT64  Lcn;
+} NTFS_PENDING_BLOCK;
+
+typedef struct {
+    UINTN              Count;
+    NTFS_PENDING_BLOCK Blocks[32];
+} NTFS_PENDING_SPLITS;
+
+static EFI_STATUS
+NtfsFlushPendingSplits (
+    IN PNTFS_EFI_VCB           Vcb,
+    IN OUT NTFS_PENDING_SPLITS *Pending
+    )
+{
+    UINTN i;
+    EFI_STATUS Status = EFI_SUCCESS;
+
+    if (Pending == NULL || Pending->Count == 0) return EFI_SUCCESS;
+    for (i = 0; i < Pending->Count; i++) {
+        if (Pending->Blocks[i].Buf != NULL) {
+            EFI_STATUS St = NtfsWriteIndexBlockAtLcn (Vcb, Pending->Blocks[i].Buf, Pending->Blocks[i].Lcn);
+            if (EFI_ERROR (St) && !EFI_ERROR (Status)) Status = St;
+            FreePool (Pending->Blocks[i].Buf);
+            Pending->Blocks[i].Buf = NULL;
+        }
+    }
+    Pending->Count = 0;
+    return Status;
+}
+
+static VOID
+NtfsFreePendingSplits (
+    IN OUT NTFS_PENDING_SPLITS *Pending
+    )
+{
+    UINTN i;
+    if (Pending == NULL) return;
+    for (i = 0; i < Pending->Count; i++) {
+        if (Pending->Blocks[i].Buf != NULL) {
+            FreePool (Pending->Blocks[i].Buf);
+            Pending->Blocks[i].Buf = NULL;
+        }
+    }
+    Pending->Count = 0;
+}
+
 /*
  * Recursive B-tree insert into the subtree rooted at NodeVCN (an INDX block).
  *   *DidSplit == FALSE: entry inserted, node rewritten in place, no promotion.
@@ -570,7 +661,8 @@ NtfsBtreeInsertRec (
     OUT    BOOLEAN                *DidSplit,
     OUT    PUCHAR                  SepOut,
     OUT    ULONG                  *SepLenOut,
-    OUT    UINT64                 *RightVCNOut
+    OUT    UINT64                 *RightVCNOut,
+    IN OUT NTFS_PENDING_SPLITS    *Pending
     )
 {
     PUCHAR                 NodeBuf = NULL, LeftBuf = NULL, RightBuf = NULL, WorkBuf = NULL;
@@ -626,7 +718,8 @@ NtfsBtreeInsertRec (
         Status = NtfsInsertIntoIndexEntries (&Blk->Header, NewEntry, Name, NameLen, Vcb->UpcaseTable);
         if (Status == EFI_ACCESS_DENIED) { FreePool (NodeBuf); return Status; }
         if (!EFI_ERROR (Status)) {                       /* fit in place */
-            Status = NtfsWriteIndexBlockAtLcn (Vcb, NodeBuf, NodeLcn);
+            Status = NtfsFlushPendingSplits (Vcb, Pending);
+            if (!EFI_ERROR (Status)) Status = NtfsWriteIndexBlockAtLcn (Vcb, NodeBuf, NodeLcn);
             FreePool (NodeBuf);
             return Status;
         }
@@ -650,7 +743,7 @@ NtfsBtreeInsertRec (
         if (NOrd < 2) { FreePool (NodeBuf); return EFI_UNSUPPORTED; }
         Half = NOrd / 2;
 
-        Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, LastRealLCN, &NewVCN, &NewLcn);
+        Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, LastRealLCN, AllocCtx, &NewVCN, &NewLcn);
         if (EFI_ERROR (Status)) { FreePool (NodeBuf); return Status; }
 
         *SepLenOut = NtfsMakeSeparator (SepOut, Ord[Half], FALSE, NodeVCN);
@@ -659,9 +752,22 @@ NtfsBtreeInsertRec (
         if (LeftBuf == NULL || RightBuf == NULL) { Status = EFI_OUT_OF_RESOURCES; goto LeafCleanup; }
         NtfsBuildBlockFromEntries (Vcb, LeftBuf,  NodeVCN, Ord, 0,        Half,             -1);
         NtfsBuildBlockFromEntries (Vcb, RightBuf, NewVCN,  Ord, Half + 1, NOrd - Half - 1,  -1);
-        Status = NtfsWriteIndexBlockAtLcn (Vcb, LeftBuf, NodeLcn);
-        if (!EFI_ERROR (Status)) Status = NtfsWriteIndexBlockAtLcn (Vcb, RightBuf, NewLcn);
-        if (!EFI_ERROR (Status)) { *DidSplit = TRUE; *RightVCNOut = NewVCN; }
+
+        if (Pending != NULL && Pending->Count + 2 <= 32) {
+            Pending->Blocks[Pending->Count].Buf = LeftBuf;
+            Pending->Blocks[Pending->Count].Lcn = NodeLcn;
+            Pending->Count++;
+            Pending->Blocks[Pending->Count].Buf = RightBuf;
+            Pending->Blocks[Pending->Count].Lcn = NewLcn;
+            Pending->Count++;
+            LeftBuf  = NULL;
+            RightBuf = NULL;
+            *DidSplit = TRUE;
+            *RightVCNOut = NewVCN;
+            Status = EFI_SUCCESS;
+        } else {
+            Status = EFI_OUT_OF_RESOURCES;
+        }
 LeafCleanup:
         if (LeftBuf)  FreePool (LeftBuf);
         if (RightBuf) FreePool (RightBuf);
@@ -692,7 +798,7 @@ LeafCleanup:
 
         Status = NtfsBtreeInsertRec (Vcb, DirRec, AllocOffset, AllocCtx, ChildVCN,
                      NewEntry, Name, NameLen, LastRealLCN, Depth + 1,
-                     &ChildSplit, ChildSep, &ChildSepLen, &ChildRight);
+                     &ChildSplit, ChildSep, &ChildSepLen, &ChildRight, Pending);
         if (EFI_ERROR (Status) || !ChildSplit) { FreePool (NodeBuf); return Status; }
 
         /* child split: repoint Slot at ChildRight and insert ChildSep before it.
@@ -705,7 +811,8 @@ LeafCleanup:
             NtfsEfiShiftForward ((PUCHAR)&Blk->Header + Off, Tail, ChildSepLen);
             CopyMem ((PUCHAR)&Blk->Header + Off, ChildSep, ChildSepLen);
             Blk->Header.TotalSizeOfEntries += ChildSepLen;
-            Status = NtfsWriteIndexBlockAtLcn (Vcb, NodeBuf, NodeLcn);
+            Status = NtfsFlushPendingSplits (Vcb, Pending);
+            if (!EFI_ERROR (Status)) Status = NtfsWriteIndexBlockAtLcn (Vcb, NodeBuf, NodeLcn);
             FreePool (NodeBuf);
             return Status;
         }
@@ -726,7 +833,7 @@ LeafCleanup:
         if (NOrd < 2) { FreePool (NodeBuf); return EFI_UNSUPPORTED; }
         Half = NOrd / 2;
 
-        Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, LastRealLCN, &NewVCN, &NewLcn);
+        Status = NtfsBtreeAllocBlock (Vcb, DirRec, AllocOffset, LastRealLCN, AllocCtx, &NewVCN, &NewLcn);
         if (EFI_ERROR (Status)) { FreePool (NodeBuf); return Status; }
 
         {
@@ -738,9 +845,22 @@ LeafCleanup:
             if (LeftBuf == NULL || RightBuf == NULL) { Status = EFI_OUT_OF_RESOURCES; goto IntCleanup; }
             NtfsBuildBlockFromEntries (Vcb, LeftBuf,  NodeVCN, Ord, 0,        Half,            MedianOrigSub);
             NtfsBuildBlockFromEntries (Vcb, RightBuf, NewVCN,  Ord, Half + 1, NOrd - Half - 1, OrigEndSub);
-            Status = NtfsWriteIndexBlockAtLcn (Vcb, LeftBuf, NodeLcn);
-            if (!EFI_ERROR (Status)) Status = NtfsWriteIndexBlockAtLcn (Vcb, RightBuf, NewLcn);
-            if (!EFI_ERROR (Status)) { *DidSplit = TRUE; *RightVCNOut = NewVCN; }
+
+            if (Pending != NULL && Pending->Count + 2 <= 32) {
+                Pending->Blocks[Pending->Count].Buf = LeftBuf;
+                Pending->Blocks[Pending->Count].Lcn = NodeLcn;
+                Pending->Count++;
+                Pending->Blocks[Pending->Count].Buf = RightBuf;
+                Pending->Blocks[Pending->Count].Lcn = NewLcn;
+                Pending->Count++;
+                LeftBuf  = NULL;
+                RightBuf = NULL;
+                *DidSplit = TRUE;
+                *RightVCNOut = NewVCN;
+                Status = EFI_SUCCESS;
+            } else {
+                Status = EFI_OUT_OF_RESOURCES;
+            }
 IntCleanup:
             if (LeftBuf)  FreePool (LeftBuf);
             if (RightBuf) FreePool (RightBuf);
@@ -879,7 +999,7 @@ NtfsBtreePushDownRoot (
         *AllocOffset = Fresh;
     }
 
-    Status = NtfsBtreeAllocBlock (Vcb, DirRec, *AllocOffset, LastRealLCN, &WVcn, &WLcn);
+    Status = NtfsBtreeAllocBlock (Vcb, DirRec, *AllocOffset, LastRealLCN, NULL, &WVcn, &WLcn);
     if (EFI_ERROR (Status)) { FreePool (Temp); return Status; }
 
     WBuf = AllocatePool (Vcb->BytesPerIndexRecord);
@@ -1094,22 +1214,38 @@ NtfsInsertIndexAllocationEntry (
     }
     if (!HaveTarget) { Status = EFI_UNSUPPORTED; goto Done; }
 
-    Status = NtfsBtreeInsertRec (Vcb, DirRec, AllocOffset, AllocCtx, RootChildVCN,
-                 NewEntry, Name, NameLen, &LastRealLCN, 0,
-                 &DidSplit, Sep, &SepLen, &RightVCN);
-    if (EFI_ERROR (Status)) { Print (L"[allocins] btreeInsertRec -> %r\n", Status); goto Done; }
+    {
+        NTFS_PENDING_SPLITS Pending;
+        ZeroMem (&Pending, sizeof (Pending));
 
-    if (DidSplit) {
-        /* the root's direct child split - land the separator in the root.
-         * The proactive push-down above guarantees it fits. */
-        Status = NtfsRootInsertSep (DirRec, Vcb, RootOffset, RootChildVCN, RightVCN, Sep, SepLen);
-        if (EFI_ERROR (Status)) { Print (L"[allocins] rootInsertSep -> %r\n", Status); goto Done; }
+        Status = NtfsBtreeInsertRec (Vcb, DirRec, AllocOffset, AllocCtx, RootChildVCN,
+                     NewEntry, Name, NameLen, &LastRealLCN, 0,
+                     &DidSplit, Sep, &SepLen, &RightVCN, &Pending);
+        if (EFI_ERROR (Status)) {
+            NtfsFreePendingSplits (&Pending);
+            Print (L"[allocins] btreeInsertRec -> %r\n", Status);
+            goto Done;
+        }
+
+        if (DidSplit) {
+            /* the root's direct child split - land the separator in the root.
+             * The proactive push-down above guarantees it fits. */
+            Status = NtfsRootInsertSep (DirRec, Vcb, RootOffset, RootChildVCN, RightVCN, Sep, SepLen);
+            if (EFI_ERROR (Status)) {
+                NtfsFreePendingSplits (&Pending);
+                Print (L"[allocins] rootInsertSep -> %r\n", Status);
+                goto Done;
+            }
+        }
+
+        Status = NtfsFlushPendingSplits (Vcb, &Pending);
+        if (EFI_ERROR (Status)) goto Done;
+
+        /* every split allocated clusters that live in DirRec - commit it once.
+         * Use the caller-supplied index, not DirRec->MFTRecordNumber: that field is
+         * untrusted on-disk data, and DirRec may be an extension record. */
+        Status = NtfsEfiWriteFileRecord (Vcb, DirRecMFT, DirRec);
     }
-
-    /* every split allocated clusters that live in DirRec - commit it once.
-     * Use the caller-supplied index, not DirRec->MFTRecordNumber: that field is
-     * untrusted on-disk data, and DirRec may be an extension record. */
-    Status = NtfsEfiWriteFileRecord (Vcb, DirRecMFT, DirRec);
 
 Done:
     if (EFI_ERROR (Status)) Print (L"[allocins] '%s' FINAL -> %r\n", Name, Status);
