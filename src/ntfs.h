@@ -806,6 +806,16 @@ NtfsInsertIndexEntry (
     IN BOOLEAN             IsDirectory
     );
 
+/* Re-insert an existing entry byte for byte (delete path: a separator that
+ * has to leave an internal node). Key must be in leaf form. */
+EFI_STATUS
+NtfsInsertIndexKey (
+    IN PNTFS_EFI_VCB          Vcb,
+    IN PFILE_RECORD_HEADER    DirRec,
+    IN ULONGLONG              DirMFT,
+    IN PINDEX_ENTRY_ATTRIBUTE Key
+    );
+
 EFI_STATUS
 NtfsEfiIndexRemoveByChild (
     IN PNTFS_EFI_VCB Vcb,

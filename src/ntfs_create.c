@@ -1175,7 +1175,8 @@ NtfsInsertIndexAllocationEntry (
     IN UINT64              NowNtfs,
     IN CONST WCHAR        *Name,
     IN UINTN               NameLen,
-    IN BOOLEAN             IsDirectory
+    IN BOOLEAN             IsDirectory,
+    IN CONST INDEX_ENTRY_ATTRIBUTE *Prebuilt   /* NULL: build from the fields above */
     )
 {
     ULONG                  RootOffset = 0, AllocOffset = 0, BitmapOffset = 0;
@@ -1184,7 +1185,8 @@ NtfsInsertIndexAllocationEntry (
     PINDEX_ENTRY_ATTRIBUTE Entry, Last;
     UCHAR                  NewEntryBuf[16 + NTFS_FILENAME_FIXED_SIZE + 512];
     PINDEX_ENTRY_ATTRIBUTE NewEntry = (PINDEX_ENTRY_ATTRIBUTE)NewEntryBuf;
-    UINT64                 KeyLen = NTFS_FILENAME_FIXED_SIZE + NameLen * sizeof (WCHAR);
+    UINT64                 KeyLen = (Prebuilt != NULL) ? Prebuilt->KeyLength
+                                          : NTFS_FILENAME_FIXED_SIZE + NameLen * sizeof (WCHAR);
     UINT64                 RootChildVCN = 0;
     BOOLEAN                HaveTarget = FALSE, DidSplit = FALSE;
     UCHAR                  Sep[16 + NTFS_FILENAME_FIXED_SIZE + 512 + 8];
@@ -1350,8 +1352,12 @@ NtfsInsertIndexAllocationEntry (
         }
     }
 
-    NtfsBuildIndexEntry (NewEntry, ChildRef, ParentRef, NowNtfs, Name, NameLen,
-        0, 0, IsDirectory ? NTFS_FILE_TYPE_DIRECTORY : NTFS_FILE_TYPE_ARCHIVE);
+    if (Prebuilt != NULL) {
+        CopyMem (NewEntry, Prebuilt, Prebuilt->Length);
+    } else {
+        NtfsBuildIndexEntry (NewEntry, ChildRef, ParentRef, NowNtfs, Name, NameLen,
+            0, 0, IsDirectory ? NTFS_FILE_TYPE_DIRECTORY : NTFS_FILE_TYPE_ARCHIVE);
+    }
 
     /* seed the mapping-pair delta base with the last real run's start LCN */
     for (i = 0; i < AllocCtx->RunCount; i++)
@@ -1925,7 +1931,8 @@ NtfsInsertIndexEntrySmall (
     IN UINT64               NowNtfs,
     IN CONST WCHAR         *Name,
     IN UINTN                NameLen,
-    IN BOOLEAN              IsDirectory
+    IN BOOLEAN              IsDirectory,
+    IN CONST INDEX_ENTRY_ATTRIBUTE *Prebuilt   /* NULL: build from the fields above */
     )
 {
     ULONG              RootOffset = 0;
@@ -1934,8 +1941,10 @@ NtfsInsertIndexEntrySmall (
     PNTFS_ATTR_RECORD  RootAttr;
     PINDEX_ROOT_ATTRIBUTE IndexRoot;
     PINDEX_ENTRY_ATTRIBUTE Entry, InsertBefore, Last;
-    UINT64             KeyLen  = NTFS_FILENAME_FIXED_SIZE + NameLen * sizeof (WCHAR);
-    UINT64             EntryLen = ROUND_UP (16 + KeyLen, 8);
+    UINT64             KeyLen  = (Prebuilt != NULL) ? Prebuilt->KeyLength
+                                                     : NTFS_FILENAME_FIXED_SIZE + NameLen * sizeof (WCHAR);
+    UINT64             EntryLen = (Prebuilt != NULL) ? Prebuilt->Length
+                                                     : ROUND_UP (16 + KeyLen, 8);
     UINT64             OldValueLen, NewValueLen, InsertOffset;
     UCHAR              NewEntryBuf[16 + NTFS_FILENAME_FIXED_SIZE + 512];
     PINDEX_ENTRY_ATTRIBUTE NewEntry = (PINDEX_ENTRY_ATTRIBUTE)NewEntryBuf;
@@ -2041,14 +2050,18 @@ NtfsInsertIndexEntrySmall (
 
     NtfsEfiShiftForward (ValPtr + InsertOffset, (UINTN)(OldValueLen - InsertOffset), (UINTN)EntryLen);
 
-    ZeroMem (NewEntry, (UINTN)EntryLen);   /* whole entry incl. 8-align padding */
-    NewEntry->Data.Directory.IndexedFile = ChildRef;
-    NewEntry->Length    = (USHORT)EntryLen;
-    NewEntry->KeyLength = (USHORT)KeyLen;
-    NewEntry->Flags     = 0;
-    NewEntry->Reserved  = 0;
-    NtfsBuildFileNameAttr (&NewEntry->FileName, ParentRef, NowNtfs, Name, NameLen,
-        IsDirectory ? NTFS_FILE_TYPE_DIRECTORY : NTFS_FILE_TYPE_ARCHIVE);
+    if (Prebuilt != NULL) {
+        CopyMem (NewEntry, Prebuilt, (UINTN)EntryLen);
+    } else {
+        ZeroMem (NewEntry, (UINTN)EntryLen);   /* whole entry incl. 8-align padding */
+        NewEntry->Data.Directory.IndexedFile = ChildRef;
+        NewEntry->Length    = (USHORT)EntryLen;
+        NewEntry->KeyLength = (USHORT)KeyLen;
+        NewEntry->Flags     = 0;
+        NewEntry->Reserved  = 0;
+        NtfsBuildFileNameAttr (&NewEntry->FileName, ParentRef, NowNtfs, Name, NameLen,
+            IsDirectory ? NTFS_FILE_TYPE_DIRECTORY : NTFS_FILE_TYPE_ARCHIVE);
+    }
     CopyMem (ValPtr + InsertOffset, NewEntry, (UINTN)EntryLen);
 
     IndexRoot->Header.TotalSizeOfEntries += (ULONG)EntryLen;
@@ -2094,17 +2107,66 @@ NtfsInsertIndexEntry (
     if (Host.HasAlloc) {
         Status = NtfsInsertIndexAllocationEntry (Vcb, Host.Rec, Host.MFTIndex,
                      Host.RootRec, Host.RootMFTIndex,
-                     ChildRef, ParentRef, NowNtfs, Name, NameLen, IsDirectory);
+                     ChildRef, ParentRef, NowNtfs, Name, NameLen, IsDirectory, NULL);
     } else {
         /* no $INDEX_ALLOCATION: the root record is the only one involved */
         Status = NtfsInsertIndexEntrySmall (Vcb, Host.RootRec, ChildRef, ParentRef,
-                     NowNtfs, Name, NameLen, IsDirectory);
+                     NowNtfs, Name, NameLen, IsDirectory, NULL);
         /* Commit here only when the root sits in an extension record; when it IS
          * the base record the caller writes it back (unchanged behaviour).
          * Test on the record NUMBER, not on RootOwn: with no $INDEX_ALLOCATION
          * the root buffer is the host buffer, so RootOwn is FALSE while Own is
          * TRUE, and keying off RootOwn would silently drop the insert. */
         if (!EFI_ERROR (Status) && Host.RootMFTIndex != DirMFT) {
+            Status = NtfsEfiWriteFileRecord (Vcb, Host.RootMFTIndex, Host.RootRec);
+        }
+    }
+
+    if (Host.RootOwn) FreePool (Host.RootRec);
+    if (Host.Own)     FreePool (Host.Rec);
+    return Status;
+}
+
+/*
+ * Put an existing index entry back into the tree, byte for byte.
+ *
+ * The delete path needs this when a separator has to leave an internal node:
+ * that entry carries a real name with the $FILE_NAME copy Windows compares
+ * against the file's own record, so it cannot be rebuilt from a name and a
+ * timestamp - it has to go back exactly as it was, minus the child pointer.
+ * Everything else is the ordinary insert: same collation, same splits, same
+ * write-back rules.
+ */
+EFI_STATUS
+NtfsInsertIndexKey (
+    IN PNTFS_EFI_VCB          Vcb,
+    IN PFILE_RECORD_HEADER    DirRec,
+    IN ULONGLONG              DirMFT,
+    IN PINDEX_ENTRY_ATTRIBUTE Key        /* leaf form: no NODE flag, no sub-VCN */
+    )
+{
+    NTFS_INDEX_HOST Host;
+    EFI_STATUS      Status;
+    CONST WCHAR    *Name;
+    UINTN           NameLen;
+
+    if (Key == NULL || (Key->Flags & (NTFS_INDEX_ENTRY_NODE | NTFS_INDEX_ENTRY_END)) != 0) {
+        return EFI_INVALID_PARAMETER;
+    }
+    Name    = Key->FileName.Name;
+    NameLen = Key->FileName.NameLength;
+
+    Status = NtfsEfiResolveIndexHost (Vcb, DirRec, DirMFT, &Host);
+    if (EFI_ERROR (Status)) return Status;
+
+    if (Host.HasAlloc) {
+        Status = NtfsInsertIndexAllocationEntry (Vcb, Host.Rec, Host.MFTIndex,
+                     Host.RootRec, Host.RootMFTIndex,
+                     0, 0, 0, Name, NameLen, FALSE, Key);
+    } else {
+        Status = NtfsInsertIndexEntrySmall (Vcb, Host.RootRec, 0, 0, 0,
+                     Name, NameLen, FALSE, Key);
+        if (!EFI_ERROR (Status)) {
             Status = NtfsEfiWriteFileRecord (Vcb, Host.RootMFTIndex, Host.RootRec);
         }
     }

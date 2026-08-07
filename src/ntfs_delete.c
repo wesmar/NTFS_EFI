@@ -232,6 +232,218 @@ Clear:
     NtfsEfiWriteFileRecord (Vcb, DirMFT, DirRec);
 }
 
+/* Copy an index entry into Dest as a plain leaf key: no NODE flag, no trailing
+ * child VCN, everything else - the file reference and the whole $FILE_NAME copy
+ * Windows checks against the file's own record - byte for byte. */
+static VOID
+NtfsCopyEntryAsLeafKey (
+    OUT PUCHAR                 Dest,
+    IN  PINDEX_ENTRY_ATTRIBUTE Src
+    )
+{
+    ULONG Body = (ULONG)OFFSET_OF (INDEX_ENTRY_ATTRIBUTE, FileName) + Src->KeyLength;
+    ULONG Len  = (ULONG)ROUND_UP (Body, 8);
+
+    ZeroMem (Dest, Len);
+    CopyMem (Dest, Src, Body);
+    ((PINDEX_ENTRY_ATTRIBUTE)Dest)->Length    = (USHORT)Len;
+    ((PINDEX_ENTRY_ATTRIBUTE)Dest)->KeyLength = Src->KeyLength;
+    ((PINDEX_ENTRY_ATTRIBUTE)Dest)->Flags     = 0;
+    ((PINDEX_ENTRY_ATTRIBUTE)Dest)->Reserved  = 0;
+}
+
+/* TRUE when the block holds nothing but its END entry. */
+static BOOLEAN
+NtfsIndexBlockHasNoKeys (
+    IN PINDEX_BUFFER Block
+    )
+{
+    PINDEX_ENTRY_ATTRIBUTE E    = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header +
+                                       Block->Header.FirstEntryOffset);
+    PINDEX_ENTRY_ATTRIBUTE Last = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header +
+                                       Block->Header.TotalSizeOfEntries);
+
+    while ((PUCHAR)E < (PUCHAR)Last && E->Length > 0) {
+        if (!(E->Flags & NTFS_INDEX_ENTRY_END)) return FALSE;
+        break;
+    }
+    return TRUE;
+}
+
+/*
+ * Take an INDX block out of the tree once its last key is gone.
+ *
+ * Deleting entries one by one empties leaves. The block that loses its last
+ * key stays marked in $BITMAP:$I30 and stays hanging off an entry in its
+ * parent, and that is a state Windows treats as damage: chkdsk reports "free
+ * space marked as allocated in the bitmap for index $I30" plus an error on the
+ * parent entry, and repairs the directory.
+ *
+ * Unhooking is the exact inverse of a split. The entry that points at the
+ * block - a separator, or the parent's END entry - loses its child pointer:
+ * the NODE flag is cleared and the trailing 8-byte VCN is cut off. A
+ * separator's key stays exactly where it is, so no name is lost, and the END
+ * entry simply goes back to its 16-byte childless form. Then the block's
+ * bitmap bit is cleared and the block is free for the next split to take.
+ *
+ * Unhooking can empty the parent in turn (an internal node whose only content
+ * was that END pointer), so this walks up until a level keeps something, at
+ * most one level per pass and bounded. The root is handled by the caller's
+ * collapse-to-resident, which is why reaching it just ends the walk.
+ */
+static VOID
+NtfsDropEmptyIndexBlock (
+    IN PNTFS_EFI_VCB       Vcb,
+    IN PFILE_RECORD_HEADER RootRec,
+    IN ULONGLONG           RootMFT,
+    IN PFILE_RECORD_HEADER DirRec,
+    IN ULONGLONG           DirMFT,
+    IN PNTFS_ATTR_CTX      AllocCtx,
+    IN ULONGLONG           EmptyVcn
+    )
+{
+    ULONGLONG Vcn = EmptyVcn;
+    ULONG     Round;
+    PUCHAR    Buf;
+    PUCHAR    KeyBuf;
+    UINT64    AllocLen;
+
+    if (AllocCtx == NULL) return;
+    AllocLen = NtfsEfiAttrDataLength (AllocCtx);
+    Buf      = AllocatePool (Vcb->BytesPerIndexRecord);
+    if (Buf == NULL) return;
+    KeyBuf = AllocatePool (Vcb->BytesPerIndexRecord);
+    if (KeyBuf == NULL) { FreePool (Buf); return; }
+
+    for (Round = 0; Round < 32; Round++) {
+        BOOLEAN   Unhooked   = FALSE;
+        BOOLEAN   ParentGone = FALSE;
+        BOOLEAN   Reinsert   = FALSE;
+        ULONGLONG ParentVcn  = 0;
+
+        /* 1. the pointer may sit in $INDEX_ROOT */
+        {
+            ULONG          RootOffset = 0;
+            PNTFS_ATTR_CTX RootCtx    = NtfsEfiFindAttrInRecord (Vcb, RootRec,
+                                            AttributeIndexRoot, L"$I30", 4, &RootOffset);
+            if (RootCtx != NULL) {
+                PNTFS_ATTR_RECORD      RA   = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
+                PUCHAR                 Val  = (PUCHAR)RA + RA->Resident.ValueOffset;
+                PINDEX_ROOT_ATTRIBUTE  Ir   = (PINDEX_ROOT_ATTRIBUTE)Val;
+                PINDEX_ENTRY_ATTRIBUTE E    = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header +
+                                                  Ir->Header.FirstEntryOffset);
+                PINDEX_ENTRY_ATTRIBUTE Last = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header +
+                                                  Ir->Header.TotalSizeOfEntries);
+
+                NtfsEfiFreeAttrCtx (RootCtx);
+                while ((PUCHAR)E < (PUCHAR)Last && E->Length > 0) {
+                    if ((E->Flags & NTFS_INDEX_ENTRY_NODE) &&
+                        *(PULONGLONG)((PUCHAR)E + E->Length - sizeof (ULONGLONG)) == Vcn) {
+                        ULONG At  = (ULONG)((PUCHAR)E - Val);
+                        ULONG Cut = (E->Flags & NTFS_INDEX_ENTRY_END)
+                                        ? (ULONG)sizeof (ULONGLONG) : E->Length;
+
+                        if (E->Flags & NTFS_INDEX_ENTRY_END) {
+                            At += E->Length - (ULONG)sizeof (ULONGLONG);
+                            E->Length = (USHORT)(E->Length - sizeof (ULONGLONG));
+                            E->Flags &= (USHORT)~NTFS_INDEX_ENTRY_NODE;
+                        } else {
+                            /* keyed separator: the whole entry leaves the node and
+                             * goes back into the tree as an ordinary key */
+                            NtfsCopyEntryAsLeafKey (KeyBuf, E);
+                            Reinsert = TRUE;
+                        }
+                        Ir->Header.TotalSizeOfEntries -= Cut;
+                        if (Ir->Header.AllocatedSize >= Cut)
+                            Ir->Header.AllocatedSize -= Cut;
+                        NtfsShrinkResidentInRecord (RootRec, RootOffset, At, Cut);
+                        NtfsEfiWriteFileRecord (Vcb, RootMFT, RootRec);
+                        Unhooked = TRUE;
+                        break;
+                    }
+                    if (E->Flags & NTFS_INDEX_ENTRY_END) break;
+                    E = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)E + E->Length);
+                }
+            }
+        }
+
+        /* 2. otherwise it sits in one of the INDX blocks */
+        if (!Unhooked) {
+            UINT64 Scan;
+
+            for (Scan = 0; Scan * Vcb->BytesPerIndexRecord < AllocLen && !Unhooked; Scan++) {
+                PINDEX_BUFFER          Block;
+                PINDEX_ENTRY_ATTRIBUTE E, Last;
+
+                if (Scan == Vcn) continue;
+                if (NtfsEfiReadAttr (Vcb, AllocCtx, Scan * Vcb->BytesPerIndexRecord,
+                                     (PCHAR)Buf, Vcb->BytesPerIndexRecord) != Vcb->BytesPerIndexRecord)
+                    continue;
+                Block = (PINDEX_BUFFER)Buf;
+                if (Block->Ntfs.Type != NRH_INDX_TYPE) continue;
+                if (EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) continue;
+                if (!NtfsEfiIndexBlockOk (Vcb, Block)) continue;
+
+                E    = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
+                Last = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
+                while ((PUCHAR)E < (PUCHAR)Last && E->Length > 0) {
+                    if ((E->Flags & NTFS_INDEX_ENTRY_NODE) &&
+                        *(PULONGLONG)((PUCHAR)E + E->Length - sizeof (ULONGLONG)) == Vcn) {
+                        BOOLEAN Applied = FALSE;
+
+                        if (E->Flags & NTFS_INDEX_ENTRY_END) {
+                            ULONG NewLen = E->Length - (ULONG)sizeof (ULONGLONG);
+                            UCHAR Copy[16];
+
+                            CopyMem (Copy, E, NewLen);
+                            ((PINDEX_ENTRY_ATTRIBUTE)Copy)->Length = (USHORT)NewLen;
+                            ((PINDEX_ENTRY_ATTRIBUTE)Copy)->Flags  =
+                                (USHORT)(E->Flags & ~NTFS_INDEX_ENTRY_NODE);
+                            Applied = NtfsSpliceInIndexBlock (Block, E, E->Length, Copy, NewLen);
+                        } else {
+                            NtfsCopyEntryAsLeafKey (KeyBuf, E);
+                            Applied  = NtfsSpliceInIndexBlock (Block, E, E->Length, NULL, 0);
+                            Reinsert = Applied;
+                        }
+                        if (Applied) {
+                            NtfsEfiWriteMultiSectorRecord (Vcb, AllocCtx,
+                                Scan * Vcb->BytesPerIndexRecord, &Block->Ntfs,
+                                Vcb->BytesPerIndexRecord);
+                            Unhooked   = TRUE;
+                            ParentGone = NtfsIndexBlockHasNoKeys (Block);
+                            ParentVcn  = Scan;
+                        }
+                        break;
+                    }
+                    if (E->Flags & NTFS_INDEX_ENTRY_END) break;
+                    E = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)E + E->Length);
+                }
+            }
+        }
+
+        if (!Unhooked) break;          /* nothing points here - leave the bit alone */
+
+        NtfsClearIndexBlockAlloc (DirRec, Vcn);
+        NtfsEfiWriteFileRecord (Vcb, DirMFT, DirRec);
+
+        if (Reinsert) {
+            /* The key left the tree with its block: put it back through the
+             * ordinary insert, then pick both records up again, because the
+             * insert works on its own copies and has just written them. */
+            NtfsInsertIndexKey (Vcb, DirRec, DirMFT, (PINDEX_ENTRY_ATTRIBUTE)KeyBuf);
+            NtfsEfiReadFileRecord (Vcb, DirMFT, DirRec);
+            if (RootMFT != DirMFT) NtfsEfiReadFileRecord (Vcb, RootMFT, RootRec);
+            break;
+        }
+
+        if (!ParentGone) break;
+        Vcn = ParentVcn;
+    }
+
+    FreePool (KeyBuf);
+    FreePool (Buf);
+}
+
 /* Extract (and delete from the tree) the maximum real key of the INDX subtree
  * rooted at Vcn - the in-order predecessor of the separator whose child this
  * subtree is.  Descends the rightmost path, but correctly falls back to a
@@ -253,6 +465,7 @@ NtfsExtractMaxKey (
     IN  ULONGLONG           Vcn,
     OUT PUCHAR              Out,       /* caller buffer >= BytesPerIndexRecord */
     OUT ULONG              *OutLen,
+    OUT ULONGLONG          *EmptiedVcn,   /* block left with no keys, or -1 */
     IN  ULONG               Depth
     )
 {
@@ -293,7 +506,7 @@ NtfsExtractMaxKey (
     /* 1. keys greater than everything here live in the rightmost child */
     if (End->Flags & NTFS_INDEX_ENTRY_NODE) {
         ULONGLONG RightVcn = *(PULONGLONG)((PUCHAR)End + End->Length - sizeof (ULONGLONG));
-        Status = NtfsExtractMaxKey (Vcb, Alloc, DirRec, DirMFT, RightVcn, Out, OutLen, Depth + 1);
+        Status = NtfsExtractMaxKey (Vcb, Alloc, DirRec, DirMFT, RightVcn, Out, OutLen, EmptiedVcn, Depth + 1);
         if (Status != EFI_NOT_FOUND) { FreePool (Buf); return Status; }
         /* rightmost subtree empty: fall through to this node's own last key */
     }
@@ -313,7 +526,7 @@ NtfsExtractMaxKey (
         PUCHAR    Pk    = AllocatePool (Vcb->BytesPerIndexRecord);
         ULONG     PkLen = 0;
         if (Pk == NULL) { FreePool (Buf); return EFI_OUT_OF_RESOURCES; }
-        Status = NtfsExtractMaxKey (Vcb, Alloc, DirRec, DirMFT, PrevChild, Pk, &PkLen, Depth + 1);
+        Status = NtfsExtractMaxKey (Vcb, Alloc, DirRec, DirMFT, PrevChild, Pk, &PkLen, EmptiedVcn, Depth + 1);
         if (Status == EFI_SUCCESS) {
             PUCHAR R = AllocatePool (Vcb->BytesPerIndexRecord);
             if (R == NULL) { FreePool (Pk); FreePool (Buf); return EFI_OUT_OF_RESOURCES; }
@@ -342,6 +555,13 @@ NtfsExtractMaxKey (
         EFI_STATUS W = NtfsEfiWriteMultiSectorRecord (Vcb, Alloc,
                             Vcn * Vcb->BytesPerCluster, &Block->Ntfs, Vcb->BytesPerIndexRecord);
         if (EFI_ERROR (W)) Status = W;
+    }
+    /* Taking the predecessor out can leave this block with nothing but its END
+     * entry. Report it upwards rather than unhooking it here: the caller is
+     * still holding blocks of its own in memory, and the unhook rewrites the
+     * parent. */
+    if (!EFI_ERROR (Status) && NtfsIndexBlockHasNoKeys (Block)) {
+        *EmptiedVcn = Vcn;
     }
     FreePool (Buf);
     return Status;
@@ -521,6 +741,7 @@ NtfsRemoveOneDirEntryByChild (
     PINDEX_ENTRY_ATTRIBUTE Entry, Last;
     EFI_STATUS          Status = EFI_NOT_FOUND;
     PNTFS_ATTR_CTX      AllocCtx;
+    ULONGLONG           Emptied = (ULONGLONG)-1;   /* block left keyless by a promotion */
 
     BaseRec = AllocatePool (Vcb->BytesPerFileRecord);
     if (BaseRec == NULL) return EFI_OUT_OF_RESOURCES;
@@ -580,7 +801,7 @@ NtfsRemoveOneDirEntryByChild (
                         if (A) NtfsEfiFreeAttrCtx (A);
                         Status = EFI_OUT_OF_RESOURCES; goto Done;
                     }
-                    Status = NtfsExtractMaxKey (Vcb, A, DirRec, DirMFT, ChildVcn, Pk, &PkLen, 0);
+                    Status = NtfsExtractMaxKey (Vcb, A, DirRec, DirMFT, ChildVcn, Pk, &PkLen, &Emptied, 0);
                     if (Status == EFI_NOT_FOUND) {
                         /* child subtree empty: free its INDX blocks, then
                          * remove the separator */
@@ -625,6 +846,10 @@ NtfsRemoveOneDirEntryByChild (
                         FreePool (R);
                     }
                     FreePool (Pk);
+                    if (!EFI_ERROR (Status) && Emptied != (ULONGLONG)-1) {
+                        NtfsDropEmptyIndexBlock (Vcb, RootRec, RootMFT, DirRec, DirMFT,
+                                                 A, Emptied);
+                    }
                     if (A) NtfsEfiFreeAttrCtx (A);
                     goto Done;
                 }
@@ -684,7 +909,7 @@ NtfsRemoveOneDirEntryByChild (
                         }
                         /* re-find AllocCtx after potential stale-ctx risk: it was
                          * opened from DirRec above, still valid here (same Vcb). */
-                        Status = NtfsExtractMaxKey (Vcb, AllocCtx, DirRec, DirMFT, ChildVcn, Pk, &PkLen, 0);
+                        Status = NtfsExtractMaxKey (Vcb, AllocCtx, DirRec, DirMFT, ChildVcn, Pk, &PkLen, &Emptied, 0);
                         if (Status == EFI_NOT_FOUND) {
                             /* child subtree empty: free its INDX blocks, then
                              * splice out the separator */
@@ -716,7 +941,12 @@ NtfsRemoveOneDirEntryByChild (
                             FreePool (R);
                         }
                         FreePool (Pk);
-                        FreePool (Buf); NtfsEfiFreeAttrCtx (AllocCtx);
+                        FreePool (Buf);
+                        if (!EFI_ERROR (Status) && Emptied != (ULONGLONG)-1) {
+                            NtfsDropEmptyIndexBlock (Vcb, RootRec, RootMFT, DirRec, DirMFT,
+                                                     AllocCtx, Emptied);
+                        }
+                        NtfsEfiFreeAttrCtx (AllocCtx);
                         goto Done;
                     }
                     {
@@ -730,6 +960,15 @@ NtfsRemoveOneDirEntryByChild (
                                     Vcn * Vcb->BytesPerIndexRecord, &Block->Ntfs,
                                     Vcb->BytesPerIndexRecord);
                         if (!EFI_ERROR (Status)) Status = EFI_SUCCESS;
+
+                        /* That was this block's last key: take the block out of
+                         * the tree instead of leaving it allocated and empty.
+                         * Only an emptying delete pays for this - roughly one
+                         * delete in as many as a block holds keys. */
+                        if (!EFI_ERROR (Status) && NtfsIndexBlockHasNoKeys (Block)) {
+                            NtfsDropEmptyIndexBlock (Vcb, RootRec, RootMFT, DirRec, DirMFT,
+                                                     AllocCtx, Vcn);
+                        }
                     }
                     FreePool (Buf); NtfsEfiFreeAttrCtx (AllocCtx);
                     goto Done;
