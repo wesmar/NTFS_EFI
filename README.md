@@ -363,7 +363,7 @@ typedef struct {
 } FILE_RECORD_HEADER, *PFILE_RECORD_HEADER;
 ```
 
-Every record read applies the update sequence array fixup and every record write un-applies it (`ntfs_mft.c`); a record whose USN does not match its per-sector copies is rejected as corrupt rather than parsed.
+Every record read applies the update sequence array fixup and every record write un-applies it (`ntfs_mft.c`); a record whose USN does not match its per-sector copies is rejected as corrupt rather than parsed. `UsaOffset` and `UsaCount` are bounds-checked against the record size the type implies before either direction runs — both loops rewrite the last two bytes of every sector-sized chunk, so an out-of-range count would write past the buffer rather than merely read past it.
 
 ### Attribute record
 
@@ -585,6 +585,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Mixed mutation pass | Create, grow, rename, cross-directory move and delete in a single run | `chkdsk` CLEAN, volume NOT dirty |
 | Same-volume EC copy and directory refill, Hyper-V | 550 files from Windows 11 `System32\drivers`, including WOF files and hard links, copied to another directory on the same NTFS volume; destination then emptied with `delete *` and filled again | 550/550 SHA256 byte-exact after refill, 0 missing, 0 mismatches, 0 extras, `chkdsk /f` CLEAN, volume NOT dirty |
 | Large copy, Hyper-V | 7 GB of mixed data, FAT source to NTFS target, ~4 minutes | `bad=0`, `chkdsk` CLEAN, volume NOT dirty |
+| Same-filesystem 92 MB copy, Hyper-V | `samefs_src.bin` copied to `samefs_dst.bin` on the same NTFS volume — non-resident growth across many runs within one file | SHA256 byte-exact, `chkdsk` CLEAN |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
 
@@ -596,7 +597,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 |---|---|---|
 | `EFI_SUCCESS` | Operation completed | Data and metadata written; flushed at unmount |
 | `EFI_UNSUPPORTED` | Unknown WOF provider/algorithm or encrypted stream; write to a compressed attribute; separator-key replacement that would overflow its block | Refused with nothing modified |
-| `EFI_VOLUME_CORRUPTED` | Bad USA fixup, wrong record signature, malformed run list | Mount or operation rejected, fail-closed |
+| `EFI_VOLUME_CORRUPTED` | Bad or out-of-range USA fixup, wrong record signature, malformed run list or mapping-pair offset, an attribute or index header whose declared size falls outside its buffer | Mount or operation rejected, fail-closed |
 | `EFI_OUT_OF_RESOURCES` | Pool allocation failed mid-operation | Allocated clusters and MFT records released first |
 | `EFI_WRITE_PROTECTED` | Read-only media or write-protected volume | Blocked at the protocol layer |
 | `EFI_ACCESS_DENIED` | Attempt to delete an NTFS metadata record (MFT index < 16) or a file with extra hard links | Refused |
@@ -617,6 +618,7 @@ Stated plainly, because each one is a deliberate boundary rather than an oversig
 7. **2048 extents per attribute.** Enough for any realistic file given run merging, but a pathologically fragmented attribute is rejected instead of truncated.
 8. **Automated coverage is uneven.** Create, write, delete, rename, move, `SetInfo`, B+tree splits and the copy paths are covered by the harness. The LZNT1, symlink and 8.3 short-name read paths are implemented but not yet fixtured for every edge case.
 9. **Little-endian x64 only.** On-disk structures are raw struct overlays; a big-endian target would need byte-swapping accessors.
+10. **`SetInfo` cannot grow a resident file.** Setting a larger `FileSize` on a small, still-resident file returns `EFI_DEVICE_ERROR` and leaves the size unchanged; growing the same file by writing to it works normally. Under investigation.
 
 ---
 
@@ -739,6 +741,8 @@ cd NTFS_EFI
 ```
 
 `build.ps1` locates MSBuild through `vswhere.exe`, builds `src\ntfs.vcxproj`, `ec\EC.vcxproj` and `probe\ntfs_probe.vcxproj` in `Release|x64`, moves the binaries into `bin\`, and cleans the intermediates.
+
+The driver and the probe build at `/W4 /WX` — warning-free, with warnings promoted to errors — and `/external:W3` keeps the vendored EDK2 headers from breaking that. `/GS-` and disabled exception handling stay as they are: freestanding UEFI has no runtime for stack cookies or C++ exceptions.
 
 | Output | Description |
 |---|---|
