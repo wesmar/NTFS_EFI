@@ -402,12 +402,18 @@ NtfsSubtreeIsEmpty (
 /* If the index has no real entries but is still marked as having children,
  * collapse it back to a clean resident-only leaf node. This frees all remaining
  * empty INDX blocks, updates the INDEX_ROOT END entry to 16 bytes (no child VCN),
- * and clears the INDEX_NODE flag. Writes DirRec to disk if modified. */
+ * and clears the INDEX_NODE flag. Writes RootRec to disk if modified.
+ *
+ * $INDEX_ROOT and $INDEX_ALLOCATION can live in two different MFT records, so
+ * both are passed in; RootRec and AllocRec alias the same buffer when they are
+ * the same record. */
 static VOID
 NtfsCollapseIndexToResident (
     IN     PNTFS_EFI_VCB       Vcb,
-    IN OUT PFILE_RECORD_HEADER DirRec,
-    IN     ULONGLONG           DirMFT
+    IN OUT PFILE_RECORD_HEADER RootRec,
+    IN     ULONGLONG           RootMFT,
+    IN OUT PFILE_RECORD_HEADER AllocRec,
+    IN     ULONGLONG           AllocMFT
     )
 {
     ULONG                  RootOffset = 0;
@@ -419,14 +425,14 @@ NtfsCollapseIndexToResident (
     PNTFS_ATTR_CTX         AllocCtx;
     BOOLEAN                Modified = FALSE;
 
-    RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx == NULL) return;
-    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset))) {
         NtfsEfiFreeAttrCtx (RootCtx);
         return;
     }
 
-    RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+    RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
     ValPtr     = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
     IndexRoot  = (PINDEX_ROOT_ATTRIBUTE)ValPtr;
     FirstEntry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.FirstEntryOffset);
@@ -437,7 +443,7 @@ NtfsCollapseIndexToResident (
         ULONGLONG ChildVcn = *(PULONGLONG)((PUCHAR)FirstEntry + FirstEntry->Length - sizeof (ULONGLONG));
         
         /* 1. Check if the subtree is actually empty first! */
-        AllocCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexAllocation, L"$I30", 4, NULL);
+        AllocCtx = NtfsEfiFindAttrInRecord (Vcb, AllocRec, AttributeIndexAllocation, L"$I30", 4, NULL);
         if (AllocCtx != NULL) {
             BOOLEAN SubtreeEmpty = NtfsSubtreeIsEmpty (Vcb, AllocCtx, ChildVcn, 0);
             if (!SubtreeEmpty) {
@@ -447,15 +453,15 @@ NtfsCollapseIndexToResident (
             }
             
             /* Subtree is empty: free all its blocks and clear bitmap */
-            NtfsFreeIndexSubtree (Vcb, AllocCtx, DirRec, DirMFT, ChildVcn, 0);
+            NtfsFreeIndexSubtree (Vcb, AllocCtx, AllocRec, AllocMFT, ChildVcn, 0);
             NtfsEfiFreeAttrCtx (AllocCtx);
         }
 
         /* 2. Re-locate INDEX_ROOT */
         NtfsEfiFreeAttrCtx (RootCtx);
-        RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+        RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
         if (RootCtx == NULL) return;
-        RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+        RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
         ValPtr     = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
         IndexRoot  = (PINDEX_ROOT_ATTRIBUTE)ValPtr;
         FirstEntry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.FirstEntryOffset);
@@ -463,12 +469,12 @@ NtfsCollapseIndexToResident (
         /* 3. Shrink END entry from 24 to 16 bytes */
         if (FirstEntry->Length == 24) {
             ULONG RemoveAt = (ULONG)((PUCHAR)FirstEntry - ValPtr) + 16;
-            NtfsShrinkResidentInRecord (DirRec, RootOffset, RemoveAt, 8);
+            NtfsShrinkResidentInRecord (RootRec, RootOffset, RemoveAt, 8);
             
             NtfsEfiFreeAttrCtx (RootCtx);
-            RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+            RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
             if (RootCtx == NULL) return;
-            RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+            RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
             ValPtr     = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
             IndexRoot  = (PINDEX_ROOT_ATTRIBUTE)ValPtr;
             FirstEntry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.FirstEntryOffset);
@@ -487,7 +493,7 @@ NtfsCollapseIndexToResident (
     NtfsEfiFreeAttrCtx (RootCtx);
 
     if (Modified) {
-        NtfsEfiWriteFileRecord (Vcb, DirMFT, DirRec);
+        NtfsEfiWriteFileRecord (Vcb, RootMFT, RootRec);
     }
 }
 
@@ -504,6 +510,8 @@ NtfsRemoveOneDirEntryByChild (
     PFILE_RECORD_HEADER BaseRec;
     PFILE_RECORD_HEADER DirRec;
     ULONGLONG           DirMFT;
+    PFILE_RECORD_HEADER RootRec;
+    ULONGLONG           RootMFT;
     NTFS_INDEX_HOST     Host;
     ULONG               RootOffset = 0;
     PNTFS_ATTR_CTX      RootCtx;
@@ -533,21 +541,23 @@ NtfsRemoveOneDirEntryByChild (
         FreePool (BaseRec);
         return Status;
     }
-    DirRec = Host.Rec;
-    DirMFT = Host.MFTIndex;
-    Status = EFI_NOT_FOUND;
+    DirRec  = Host.Rec;          /* $INDEX_ALLOCATION + $BITMAP live here      */
+    DirMFT  = Host.MFTIndex;
+    RootRec = Host.RootRec;      /* $INDEX_ROOT may live in a different record  */
+    RootMFT = Host.RootMFTIndex;
+    Status  = EFI_NOT_FOUND;
 
     /* --- 1. resident $INDEX_ROOT --- */
-    RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx != NULL &&
-        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset))) {
         NtfsEfiFreeAttrCtx (RootCtx);
         RootCtx = NULL;            /* Done: frees it again otherwise */
         Status = EFI_VOLUME_CORRUPTED;
         goto Done;
     }
     if (RootCtx != NULL) {
-        RootAttr  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+        RootAttr  = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
         ValPtr    = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
         IndexRoot = (PINDEX_ROOT_ATTRIBUTE)ValPtr;
         Entry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.FirstEntryOffset);
@@ -581,8 +591,8 @@ NtfsRemoveOneDirEntryByChild (
                         IndexRoot->Header.TotalSizeOfEntries -= RemoveLen;
                         if (IndexRoot->Header.AllocatedSize >= RemoveLen)
                             IndexRoot->Header.AllocatedSize -= RemoveLen;
-                        NtfsShrinkResidentInRecord (DirRec, RootOffset, RemoveAt, RemoveLen);
-                        Status = NtfsEfiWriteFileRecord (Vcb, DirMFT, DirRec);
+                        NtfsShrinkResidentInRecord (RootRec, RootOffset, RemoveAt, RemoveLen);
+                        Status = NtfsEfiWriteFileRecord (Vcb, RootMFT, RootRec);
                         if (!EFI_ERROR (Status)) Status = EFI_SUCCESS;
                         }
                     } else if (!EFI_ERROR (Status)) {
@@ -598,17 +608,17 @@ NtfsRemoveOneDirEntryByChild (
                                                (PINDEX_ENTRY_ATTRIBUTE)Pk, ChildVcn);
                             INTN  Delta  = (INTN)RLen - (INTN)Entry->Length;
                             if (Delta > 0 &&
-                                DirRec->BytesInUse + (ULONG)Delta > Vcb->BytesPerFileRecord) {
+                                RootRec->BytesInUse + (ULONG)Delta > Vcb->BytesPerFileRecord) {
                                 Status = EFI_UNSUPPORTED; /* record full; bail */
                             } else {
                                 ULONG RemoveAt = (ULONG)((PUCHAR)Entry - ValPtr);
-                                NtfsSpliceResidentInRecord (DirRec, RootOffset, RemoveAt,
+                                NtfsSpliceResidentInRecord (RootRec, RootOffset, RemoveAt,
                                         Entry->Length, R, RLen);
                                 IndexRoot->Header.TotalSizeOfEntries =
                                     (ULONG)((INTN)IndexRoot->Header.TotalSizeOfEntries + Delta);
                                 IndexRoot->Header.AllocatedSize =
                                     (ULONG)((INTN)IndexRoot->Header.AllocatedSize + Delta);
-                                Status = NtfsEfiWriteFileRecord (Vcb, DirMFT, DirRec);
+                                Status = NtfsEfiWriteFileRecord (Vcb, RootMFT, RootRec);
                                 if (!EFI_ERROR (Status)) Status = EFI_SUCCESS;
                             }
                         }
@@ -624,8 +634,8 @@ NtfsRemoveOneDirEntryByChild (
                     IndexRoot->Header.TotalSizeOfEntries -= RemoveLen;
                     if (IndexRoot->Header.AllocatedSize >= RemoveLen)
                         IndexRoot->Header.AllocatedSize -= RemoveLen;
-                    NtfsShrinkResidentInRecord (DirRec, RootOffset, RemoveAt, RemoveLen);
-                    Status = NtfsEfiWriteFileRecord (Vcb, DirMFT, DirRec);
+                    NtfsShrinkResidentInRecord (RootRec, RootOffset, RemoveAt, RemoveLen);
+                    Status = NtfsEfiWriteFileRecord (Vcb, RootMFT, RootRec);
                     if (!EFI_ERROR (Status)) Status = EFI_SUCCESS;
                 }
                 goto Done;
@@ -735,9 +745,11 @@ NtfsRemoveOneDirEntryByChild (
 Done:
     if (RootCtx != NULL) NtfsEfiFreeAttrCtx (RootCtx);
     if (!EFI_ERROR (Status)) {
-        NtfsCollapseIndexToResident (Vcb, DirRec, DirMFT);
+        /* the collapse edits $INDEX_ROOT, so it works on the root's record */
+        NtfsCollapseIndexToResident (Vcb, RootRec, RootMFT, DirRec, DirMFT);
     }
-    if (Host.Own) FreePool (Host.Rec);
+    if (Host.RootOwn) FreePool (Host.RootRec);
+    if (Host.Own)     FreePool (Host.Rec);
     FreePool (BaseRec);
     return Status;
 }
@@ -877,17 +889,18 @@ NtfsDirectoryIsEmpty (
     if (EFI_ERROR (NtfsEfiResolveIndexHost (Vcb, BaseRec, BaseMFT, &Host))) return FALSE;
     Rec = Host.Rec;
 
-    RootCtx = NtfsEfiFindAttrInRecord (Vcb, Rec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    RootCtx = NtfsEfiFindAttrInRecord (Vcb, Host.RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx != NULL &&
-        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)Rec + RootOffset))) {
+        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)Host.RootRec + RootOffset))) {
         /* fail closed, like the rest of this function: an index we cannot
          * trust must never read as "empty" (that would orphan children) */
         NtfsEfiFreeAttrCtx (RootCtx);
-        if (Host.Own) FreePool (Host.Rec);
+        if (Host.RootOwn) FreePool (Host.RootRec);
+        if (Host.Own)     FreePool (Host.Rec);
         return FALSE;
     }
     if (RootCtx != NULL) {
-        PNTFS_ATTR_RECORD RootAttr = (PNTFS_ATTR_RECORD)((PUCHAR)Rec + RootOffset);
+        PNTFS_ATTR_RECORD RootAttr = (PNTFS_ATTR_RECORD)((PUCHAR)Host.RootRec + RootOffset);
         PUCHAR ValPtr = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
         PINDEX_ROOT_ATTRIBUTE IndexRoot = (PINDEX_ROOT_ATTRIBUTE)ValPtr;
         PINDEX_ENTRY_ATTRIBUTE Entry =
@@ -903,7 +916,7 @@ NtfsDirectoryIsEmpty (
         NtfsEfiFreeAttrCtx (RootCtx);
     }
 
-    if (!Empty) { if (Host.Own) FreePool (Host.Rec); return FALSE; }
+    if (!Empty) { if (Host.RootOwn) FreePool (Host.RootRec); if (Host.Own) FreePool (Host.Rec); return FALSE; }
 
     /* any INDX block with a non-END entry means non-empty too */
     AllocCtx = NtfsEfiFindAttrInRecord (Vcb, Rec, AttributeIndexAllocation, L"$I30", 4, NULL);
@@ -935,7 +948,8 @@ NtfsDirectoryIsEmpty (
         }
         NtfsEfiFreeAttrCtx (AllocCtx);
     }
-    if (Host.Own) FreePool (Host.Rec);
+    if (Host.RootOwn) FreePool (Host.RootRec);
+    if (Host.Own)     FreePool (Host.Rec);
     return Empty;
 }
 

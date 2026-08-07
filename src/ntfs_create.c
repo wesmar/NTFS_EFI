@@ -667,7 +667,7 @@ NtfsBtreeInsertRec (
 {
     PUCHAR                 NodeBuf = NULL, LeftBuf = NULL, RightBuf = NULL, WorkBuf = NULL;
     PINDEX_BUFFER          Blk;
-    PINDEX_ENTRY_ATTRIBUTE E, EndE, Ord[512];
+    PINDEX_ENTRY_ATTRIBUTE E, EndE, EndEntry, Ord[512];
     UINTN                  NOrd, Half;
     INT64                  NodeLcn, NewLcn;
     UINT64                 NewVCN;
@@ -702,14 +702,28 @@ NtfsBtreeInsertRec (
     E    = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Blk->Header + Blk->Header.FirstEntryOffset);
     EndE = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Blk->Header + Blk->Header.TotalSizeOfEntries);
 
-    /* internal iff the END entry carries a sub-node pointer */
+    /*
+     * Internal iff the END entry carries a sub-node pointer. Keep the pointer to
+     * that entry: EndE is the END BOUNDARY (Header + TotalSizeOfEntries, i.e.
+     * just PAST the END entry), so it must never be dereferenced as an entry.
+     */
     {
         PINDEX_ENTRY_ATTRIBUTE T = E;
         IsInternal = FALSE;
+        EndEntry   = NULL;
         while ((PUCHAR)T < (PUCHAR)EndE) {
             if (T->Length == 0) { FreePool (NodeBuf); return EFI_VOLUME_CORRUPTED; }
-            if (T->Flags & NTFS_INDEX_ENTRY_END) { IsInternal = (T->Flags & NTFS_INDEX_ENTRY_NODE) != 0; break; }
+            if (T->Flags & NTFS_INDEX_ENTRY_END) {
+                EndEntry   = T;
+                IsInternal = (T->Flags & NTFS_INDEX_ENTRY_NODE) != 0;
+                break;
+            }
             T = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)T + T->Length);
+        }
+        if (EndEntry == NULL) { FreePool (NodeBuf); return EFI_VOLUME_CORRUPTED; }
+        if (IsInternal && EndEntry->Length < 16 + sizeof (UINT64)) {
+            FreePool (NodeBuf);
+            return EFI_VOLUME_CORRUPTED;   /* NODE flag but no room for a child VCN */
         }
     }
 
@@ -837,8 +851,23 @@ LeafCleanup:
         if (EFI_ERROR (Status)) { FreePool (NodeBuf); return Status; }
 
         {
+            /*
+             * The right half inherits this node's own END child pointer, read
+             * from the END ENTRY - not from EndE, which is the boundary just
+             * past it. Reading it there picked up whatever bytes followed the
+             * last entry (in practice UTF-16 fragments of the neighbouring
+             * file name) and stamped them into the new node's END entry as its
+             * child VCN. Every later descent through that node then hit an
+             * unmapped VCN and returned EFI_VOLUME_CORRUPTED, while the
+             * subtree that should have hung off it - and every entry already
+             * in it - became unreachable: files created and written, invisible
+             * to Windows, recovered by chkdsk as orphans.
+             *
+             * Slot was repointed at ChildRight above, so when Slot IS the END
+             * entry this correctly yields ChildRight.
+             */
             INT64  MedianOrigSub = (INT64)NTFS_ENTRY_SUBVCN (Ord[Half]);   /* left half's END pointer */
-            INT64  OrigEndSub    = (INT64)NTFS_ENTRY_SUBVCN (EndE);         /* right half's END pointer */
+            INT64  OrigEndSub    = (INT64)NTFS_ENTRY_SUBVCN (EndEntry);    /* right half's END pointer */
             *SepLenOut = NtfsMakeSeparator (SepOut, Ord[Half], TRUE, NodeVCN);
             LeftBuf  = AllocatePool (Vcb->BytesPerIndexRecord);
             RightBuf = AllocatePool (Vcb->BytesPerIndexRecord);
@@ -931,8 +960,11 @@ NtfsRootInsertSep (
 static EFI_STATUS
 NtfsBtreePushDownRoot (
     IN     PNTFS_EFI_VCB       Vcb,
-    IN OUT PFILE_RECORD_HEADER DirRec,
+    IN OUT PFILE_RECORD_HEADER RootRec,     /* record holding $INDEX_ROOT       */
     IN     ULONG                RootOffset,
+    IN OUT PFILE_RECORD_HEADER AllocRec,    /* record holding $INDEX_ALLOCATION;
+                                             * aliases RootRec when both live in
+                                             * the same record                  */
     IN OUT ULONG               *AllocOffset,
     IN OUT INT64               *LastRealLCN
     )
@@ -948,7 +980,7 @@ NtfsBtreePushDownRoot (
     ULONG                  FEO;
     EFI_STATUS             Status;
 
-    RA  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+    RA  = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
     Val = (PUCHAR)RA + RA->Resident.ValueOffset;
     Ir  = (PINDEX_ROOT_ATTRIBUTE)Val;
     FEO = Ir->Header.FirstEntryOffset;
@@ -976,7 +1008,7 @@ NtfsBtreePushDownRoot (
         ULONG NewAttrLen = (ULONG)ROUND_UP (RA->Resident.ValueOffset + NewValLen, ATTR_RECORD_ALIGNMENT);
         LONG  Delta      = (LONG)NewAttrLen - (LONG)OldAttrLen;
         PUCHAR NextAttr  = (PUCHAR)RA + OldAttrLen;
-        UINTN  TailLen   = DirRec->BytesInUse - (ULONG)(NextAttr - (PUCHAR)DirRec);
+        UINTN  TailLen   = RootRec->BytesInUse - (ULONG)(NextAttr - (PUCHAR)RootRec);
         PINDEX_ENTRY_ATTRIBUTE NewEnd = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header + FEO);
         ZeroMem (NewEnd, 24);
         NewEnd->Length = 24;
@@ -987,19 +1019,19 @@ NtfsBtreePushDownRoot (
         RA->Resident.ValueLength = NewValLen;
         if (Delta != 0) CopyMem (NextAttr + Delta, NextAttr, TailLen);
         RA->Length = NewAttrLen;
-        DirRec->BytesInUse = (ULONG)((LONG)DirRec->BytesInUse + Delta);
+        RootRec->BytesInUse = (ULONG)((LONG)RootRec->BytesInUse + Delta);
     }
 
     /* re-find $INDEX_ALLOCATION (the shrink shifted it back) */
     {
         ULONG          Fresh = 0;
-        PNTFS_ATTR_CTX P = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexAllocation, L"$I30", 4, &Fresh);
+        PNTFS_ATTR_CTX P = NtfsEfiFindAttrInRecord (Vcb, AllocRec, AttributeIndexAllocation, L"$I30", 4, &Fresh);
         if (P == NULL) { FreePool (Temp); return EFI_VOLUME_CORRUPTED; }
         NtfsEfiFreeAttrCtx (P);
         *AllocOffset = Fresh;
     }
 
-    Status = NtfsBtreeAllocBlock (Vcb, DirRec, *AllocOffset, LastRealLCN, NULL, &WVcn, &WLcn);
+    Status = NtfsBtreeAllocBlock (Vcb, AllocRec, *AllocOffset, LastRealLCN, NULL, &WVcn, &WLcn);
     if (EFI_ERROR (Status)) { FreePool (Temp); return Status; }
 
     WBuf = AllocatePool (Vcb->BytesPerIndexRecord);
@@ -1011,19 +1043,30 @@ NtfsBtreePushDownRoot (
     if (EFI_ERROR (Status)) return Status;
 
     /* point the root's END entry at W */
-    RA  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+    RA  = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
     Val = (PUCHAR)RA + RA->Resident.ValueOffset;
     Ir  = (PINDEX_ROOT_ATTRIBUTE)Val;
     NTFS_ENTRY_SUBVCN ((PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header + Ir->Header.FirstEntryOffset)) = WVcn;
     return EFI_SUCCESS;
 }
 
+/*
+ * DirRec/DirRecMFT is the record holding $INDEX_ALLOCATION + $BITMAP; RootRec/
+ * RootRecMFT the one holding $INDEX_ROOT. Windows routinely puts these in two
+ * different records (root in the base, the rest in an $ATTRIBUTE_LIST extension
+ * record), and both get edited here - the root for a promoted separator, the
+ * other for mapping pairs and allocation bits - so both are passed in, resolved
+ * by NtfsEfiResolveIndexHost. When the directory keeps everything in one record
+ * the two pointers alias, and the single write at the end covers both edits.
+ */
 static EFI_STATUS
 NtfsInsertIndexAllocationEntry (
     IN PNTFS_EFI_VCB       Vcb,
     IN PFILE_RECORD_HEADER DirRec,
     IN ULONGLONG           DirRecMFT,   /* MFT index OF DirRec (may be an
                                          * $ATTRIBUTE_LIST extension record) */
+    IN PFILE_RECORD_HEADER RootRec,     /* record holding $INDEX_ROOT:$I30      */
+    IN ULONGLONG           RootRecMFT,  /* its MFT index                        */
     IN UINT64              ChildRef,
     IN UINT64              ParentRef,
     IN UINT64              NowNtfs,
@@ -1050,19 +1093,28 @@ NtfsInsertIndexAllocationEntry (
 
     if (16 + KeyLen > sizeof (NewEntryBuf)) return EFI_UNSUPPORTED;
 
-    RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    /*
+     * Find $INDEX_ROOT inside the record that actually holds it, so RootOffset
+     * and RootRec belong to the same buffer. Searching with NtfsEfiFindAttribute
+     * would follow $ATTRIBUTE_LIST into a record it reads into a temporary
+     * buffer and frees before returning - the offset it reports would then index
+     * a buffer that no longer exists, and the attribute context it hands back is
+     * a copy of the ATTRIBUTE alone, not of the 1 KB file record the resident
+     * grow/shift code needs.
+     */
+    RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx == NULL) return EFI_UNSUPPORTED;
     /* everything below derives entry pointers and shift lengths from this
      * header's on-disk offsets - reject an implausible one up front */
-    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset))) {
         NtfsEfiFreeAttrCtx (RootCtx);
         return EFI_VOLUME_CORRUPTED;
     }
     NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexAllocation, L"$I30", 4, &AllocOffset);
     NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap, L"$I30", 4, &BitmapOffset);
-    NtfsEfiFreeAttrCtx (RootCtx);
     AllocCtx = NtfsEfiFindAttribute (Vcb, DirRec, AttributeIndexAllocation, L"$I30", 4, NULL);
     if (AllocCtx == NULL || AllocOffset == 0 || BitmapOffset == 0) {
+        NtfsEfiFreeAttrCtx (RootCtx);
         if (AllocCtx) NtfsEfiFreeAttrCtx (AllocCtx);
         return EFI_UNSUPPORTED;
     }
@@ -1081,7 +1133,7 @@ NtfsInsertIndexAllocationEntry (
      * "delete *" returned EFI_UNSUPPORTED until the directory was recreated.
      */
     {
-        PNTFS_ATTR_RECORD      RA = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+        PNTFS_ATTR_RECORD      RA = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
         PINDEX_ROOT_ATTRIBUTE Ir = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
 
         if (!(Ir->Header.Flags & INDEX_ROOT_LARGE)) {
@@ -1107,7 +1159,7 @@ NtfsInsertIndexAllocationEntry (
             FreePool (EmptyBlock);
             if (EFI_ERROR (Status)) goto Done;
 
-            if (!NtfsEfiGrowResidentInRecord (Vcb, DirRec, RootOffset,
+            if (!NtfsEfiGrowResidentInRecord (Vcb, RootRec, RootOffset,
                                                RA->Resident.ValueLength + 8)) {
                 Status = EFI_UNSUPPORTED;
                 goto Done;
@@ -1123,7 +1175,7 @@ NtfsInsertIndexAllocationEntry (
             if (Probe == NULL) { Status = EFI_VOLUME_CORRUPTED; goto Done; }
             NtfsEfiFreeAttrCtx (Probe);
 
-            RA  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+            RA  = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
             Ir  = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
             End = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Ir->Header + Ir->Header.FirstEntryOffset);
             ZeroMem (End, 24);
@@ -1143,8 +1195,15 @@ NtfsInsertIndexAllocationEntry (
                 *((PUCHAR)Bm + Bm->Resident.ValueOffset) |= 1;
             }
 
+            /* the allocation bit + mapping live in DirRec, the restored
+             * END|NODE root in RootRec: commit both, or a later failure would
+             * leave an allocated block that no root entry points at */
             Status = NtfsEfiWriteFileRecord (Vcb, DirRecMFT, DirRec);
             if (EFI_ERROR (Status)) goto Done;
+            if (RootRec != DirRec) {
+                Status = NtfsEfiWriteFileRecord (Vcb, RootRecMFT, RootRec);
+                if (EFI_ERROR (Status)) goto Done;
+            }
 
             NtfsEfiFreeAttrCtx (AllocCtx);
             AllocCtx = NtfsEfiFindAttribute (Vcb, DirRec, AttributeIndexAllocation,
@@ -1165,7 +1224,7 @@ NtfsInsertIndexAllocationEntry (
      * it down FIRST so every promotion on the way down is guaranteed to fit
      * and no split stalls with a full record. */
     {
-        PNTFS_ATTR_RECORD     RA = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+        PNTFS_ATTR_RECORD     RA = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
         PINDEX_ROOT_ATTRIBUTE Ir = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
         UINT64 SepNeed = ROUND_UP (16 + NTFS_FILENAME_FIXED_SIZE + NameLen * sizeof (WCHAR) + sizeof (UINT64),
                                    ATTR_RECORD_ALIGNMENT) + 96;
@@ -1177,9 +1236,9 @@ NtfsInsertIndexAllocationEntry (
          * minimal we fall through: the insert descends into the child and any
          * promoted separator lands in the root, which has room for one. */
         if ((Ir->Header.Flags & INDEX_ROOT_LARGE) &&
-            (UINT64)(DirRec->BytesAllocated - DirRec->BytesInUse) < SepNeed &&
+            (UINT64)(RootRec->BytesAllocated - RootRec->BytesInUse) < SepNeed &&
             (UINT64)Ir->Header.TotalSizeOfEntries > (UINT64)Ir->Header.FirstEntryOffset + 24) {
-            Status = NtfsBtreePushDownRoot (Vcb, DirRec, RootOffset, &AllocOffset, &LastRealLCN);
+            Status = NtfsBtreePushDownRoot (Vcb, RootRec, RootOffset, DirRec, &AllocOffset, &LastRealLCN);
             if (EFI_ERROR (Status)) goto Done;
             /* push-down appended a run for W; re-decode the run list so the
              * descent can read the just-created node (its VCN is new) */
@@ -1191,7 +1250,7 @@ NtfsInsertIndexAllocationEntry (
 
     /* pick the root child subtree for Name (root is an internal node here) */
     {
-        PNTFS_ATTR_RECORD RA = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
+        PNTFS_ATTR_RECORD RA = (PNTFS_ATTR_RECORD)((PUCHAR)RootRec + RootOffset);
         IndexRoot = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RA + RA->Resident.ValueOffset);
     }
     Entry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.FirstEntryOffset);
@@ -1223,33 +1282,48 @@ NtfsInsertIndexAllocationEntry (
                      &DidSplit, Sep, &SepLen, &RightVCN, &Pending);
         if (EFI_ERROR (Status)) {
             NtfsFreePendingSplits (&Pending);
-            Print (L"[allocins] btreeInsertRec -> %r\n", Status);
             goto Done;
         }
 
         if (DidSplit) {
             /* the root's direct child split - land the separator in the root.
              * The proactive push-down above guarantees it fits. */
-            Status = NtfsRootInsertSep (DirRec, Vcb, RootOffset, RootChildVCN, RightVCN, Sep, SepLen);
+            Status = NtfsRootInsertSep (RootRec, Vcb, RootOffset, RootChildVCN, RightVCN, Sep, SepLen);
             if (EFI_ERROR (Status)) {
                 NtfsFreePendingSplits (&Pending);
-                Print (L"[allocins] rootInsertSep -> %r\n", Status);
                 goto Done;
             }
         }
 
-        Status = NtfsFlushPendingSplits (Vcb, &Pending);
-        if (EFI_ERROR (Status)) goto Done;
-
-        /* every split allocated clusters that live in DirRec - commit it once.
-         * Use the caller-supplied index, not DirRec->MFTRecordNumber: that field is
-         * untrusted on-disk data, and DirRec may be an extension record. */
+        /*
+         * Persist the records BEFORE the queued index blocks. The mapping pairs
+         * and the root's child pointers must be on disk first; a block written
+         * ahead of its mapping is a block nothing can reach. RootRec is written
+         * with the index the resolver gave us - never RootRec->MFTRecordNumber,
+         * which is untrusted on-disk data - and only when it is a different
+         * record, since an alias would write the same record twice.
+         */
+        if (RootRec != DirRec) {
+            Status = NtfsEfiWriteFileRecord (Vcb, RootRecMFT, RootRec);
+            if (EFI_ERROR (Status)) {
+                NtfsFreePendingSplits (&Pending);
+                goto Done;
+            }
+        }
         Status = NtfsEfiWriteFileRecord (Vcb, DirRecMFT, DirRec);
+        if (EFI_ERROR (Status)) {
+            NtfsFreePendingSplits (&Pending);
+            goto Done;
+        }
+
+        /* both records are on disk now, so every queued block has a mapping and
+         * a parent pointer waiting for it */
+        Status = NtfsFlushPendingSplits (Vcb, &Pending);
     }
 
 Done:
-    if (EFI_ERROR (Status)) Print (L"[allocins] '%s' FINAL -> %r\n", Name, Status);
     NtfsEfiFreeAttrCtx (AllocCtx);
+    NtfsEfiFreeAttrCtx (RootCtx);
     return Status;
 }
 
@@ -1881,16 +1955,24 @@ NtfsInsertIndexEntry (
 
     if (Host.HasAlloc) {
         Status = NtfsInsertIndexAllocationEntry (Vcb, Host.Rec, Host.MFTIndex,
+                     Host.RootRec, Host.RootMFTIndex,
                      ChildRef, ParentRef, NowNtfs, Name, NameLen, IsDirectory);
     } else {
-        Status = NtfsInsertIndexEntrySmall (Vcb, Host.Rec, ChildRef, ParentRef,
+        /* no $INDEX_ALLOCATION: the root record is the only one involved */
+        Status = NtfsInsertIndexEntrySmall (Vcb, Host.RootRec, ChildRef, ParentRef,
                      NowNtfs, Name, NameLen, IsDirectory);
-        if (!EFI_ERROR (Status) && Host.Own) {
-            Status = NtfsEfiWriteFileRecord (Vcb, Host.MFTIndex, Host.Rec);
+        /* Commit here only when the root sits in an extension record; when it IS
+         * the base record the caller writes it back (unchanged behaviour).
+         * Test on the record NUMBER, not on RootOwn: with no $INDEX_ALLOCATION
+         * the root buffer is the host buffer, so RootOwn is FALSE while Own is
+         * TRUE, and keying off RootOwn would silently drop the insert. */
+        if (!EFI_ERROR (Status) && Host.RootMFTIndex != DirMFT) {
+            Status = NtfsEfiWriteFileRecord (Vcb, Host.RootMFTIndex, Host.RootRec);
         }
     }
 
-    if (Host.Own) FreePool (Host.Rec);
+    if (Host.RootOwn) FreePool (Host.RootRec);
+    if (Host.Own)     FreePool (Host.Rec);
     return Status;
 }
 

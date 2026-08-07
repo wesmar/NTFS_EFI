@@ -449,40 +449,42 @@ NtfsEfiResolveIndexHost (
     OUT PNTFS_INDEX_HOST     Host
     )
 {
-    PNTFS_ATTR_CTX       Ctx;
-    PNTFS_ATTR_CTX       ListCtx;
-    UINT64               ListLen;
-    PUCHAR               ListBuf;
     PNTFS_ATTR_LIST_ITEM Item;
     PUCHAR               ListEnd;
-    ULONGLONG            HostIdx  = (ULONGLONG)-1LL;
-    BOOLEAN              Split    = FALSE;
-    BOOLEAN              SawRoot  = FALSE;
-    BOOLEAN              SawAlloc = FALSE;
+    UINT64               ListLen;
+    PUCHAR               ListBuf;
+    PNTFS_ATTR_CTX       ListCtx;
+    ULONGLONG RootMFT   = (ULONGLONG)-1LL;
+    ULONGLONG AllocMFT  = (ULONGLONG)-1LL;
+    ULONGLONG BitmapMFT = (ULONGLONG)-1LL;
 
-    Host->Rec = NULL; Host->MFTIndex = 0; Host->Own = FALSE; Host->HasAlloc = FALSE;
+    Host->Rec = NULL; Host->MFTIndex = 0; Host->Own = FALSE;
+    Host->RootRec = NULL; Host->RootMFTIndex = 0; Host->RootOwn = FALSE;
+    Host->HasAlloc = FALSE;
 
     ListCtx = NtfsEfiFindAttrInRecord (Vcb, BaseRec, AttributeAttributeList, NULL, 0, NULL);
     if (ListCtx == NULL) {
         /* no $ATTRIBUTE_LIST: everything this file has is in the base record */
-        Ctx = NtfsEfiFindAttrInRecord (Vcb, BaseRec, AttributeIndexRoot, L"$I30", 4, NULL);
+        PNTFS_ATTR_CTX Ctx = NtfsEfiFindAttrInRecord (Vcb, BaseRec, AttributeIndexRoot, L"$I30", 4, NULL);
         if (Ctx == NULL) return EFI_UNSUPPORTED;      /* not a directory */
         NtfsEfiFreeAttrCtx (Ctx);
         Ctx = NtfsEfiFindAttrInRecord (Vcb, BaseRec, AttributeIndexAllocation, L"$I30", 4, NULL);
         if (Ctx != NULL) { Host->HasAlloc = TRUE; NtfsEfiFreeAttrCtx (Ctx); }
-        Host->Rec = BaseRec; Host->MFTIndex = BaseMFT; Host->Own = FALSE;
+        Host->Rec     = BaseRec; Host->MFTIndex     = BaseMFT; Host->Own     = FALSE;
+        Host->RootRec = BaseRec; Host->RootMFTIndex = BaseMFT; Host->RootOwn = FALSE;
         return EFI_SUCCESS;
     }
 
     ListLen = NtfsEfiAttrDataLength (ListCtx);
     if (ListLen < sizeof (NTFS_ATTR_LIST_ITEM) || ListLen > (UINT64)(1024 * 1024)) {
         NtfsEfiFreeAttrCtx (ListCtx);
-        return EFI_UNSUPPORTED;
+        return EFI_VOLUME_CORRUPTED;
     }
     ListBuf = AllocatePool ((UINTN)ListLen);
     if (ListBuf == NULL) { NtfsEfiFreeAttrCtx (ListCtx); return EFI_OUT_OF_RESOURCES; }
     if (NtfsEfiReadAttr (Vcb, ListCtx, 0, (PCHAR)ListBuf, (ULONG)ListLen) != (ULONG)ListLen) {
-        FreePool (ListBuf); NtfsEfiFreeAttrCtx (ListCtx);
+        FreePool (ListBuf);
+        NtfsEfiFreeAttrCtx (ListCtx);
         return EFI_VOLUME_CORRUPTED;
     }
     NtfsEfiFreeAttrCtx (ListCtx);
@@ -497,53 +499,89 @@ NtfsEfiResolveIndexHost (
         if (Item->Type == (ULONG)AttributeIndexRoot ||
             Item->Type == (ULONG)AttributeIndexAllocation ||
             Item->Type == (ULONG)AttributeBitmap) {
-            /*
-             * Only the $I30 (directory) index counts. A file can carry an
-             * unrelated unnamed $BITMAP, and the $Extend metafiles carry other
-             * named indexes ($SDH/$SII/$O/$R) - matching those would drag us to
-             * the wrong record.
-             */
             if (Item->NameLength == 4 &&
                 (PUCHAR)Item + Item->NameOffset + 4 * sizeof (WCHAR) <= ListEnd &&
                 CompareMem ((PWCHAR)((PUCHAR)Item + Item->NameOffset),
                             L"$I30", 4 * sizeof (WCHAR)) == 0) {
                 ULONGLONG At = Item->MFTIndex & NTFS_MFT_MASK;
-                if (HostIdx == (ULONGLONG)-1LL) HostIdx = At;
-                else if (HostIdx != At)         Split   = TRUE;
-                if (Item->Type == (ULONG)AttributeIndexRoot)       SawRoot  = TRUE;
-                if (Item->Type == (ULONG)AttributeIndexAllocation) SawAlloc = TRUE;
+                if (Item->Type == (ULONG)AttributeIndexRoot)       RootMFT   = At;
+                if (Item->Type == (ULONG)AttributeIndexAllocation) AllocMFT  = At;
+                if (Item->Type == (ULONG)AttributeBitmap)          BitmapMFT = At;
             }
         }
         Item = (PNTFS_ATTR_LIST_ITEM)((PUCHAR)Item + Item->Length);
     }
     FreePool (ListBuf);
 
-    if (!SawRoot || HostIdx == (ULONGLONG)-1LL) return EFI_UNSUPPORTED;  /* no $I30 index */
-    if (Split)                                  return EFI_UNSUPPORTED;  /* spread out */
-
-    if (HostIdx == BaseMFT) {
-        Ctx = NtfsEfiFindAttrInRecord (Vcb, BaseRec, AttributeIndexRoot, L"$I30", 4, NULL);
-        if (Ctx == NULL) return EFI_VOLUME_CORRUPTED;   /* list disagrees with record */
-        NtfsEfiFreeAttrCtx (Ctx);
-        Host->Rec = BaseRec; Host->MFTIndex = BaseMFT; Host->Own = FALSE;
-        Host->HasAlloc = SawAlloc;
-        return EFI_SUCCESS;
-    }
+    if (RootMFT == (ULONGLONG)-1LL) return EFI_UNSUPPORTED;  /* no $I30 index */
 
     {
-        PFILE_RECORD_HEADER Rec = AllocatePool (Vcb->BytesPerFileRecord);
-        if (Rec == NULL) return EFI_OUT_OF_RESOURCES;
-        if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, HostIdx, Rec))) {
-            FreePool (Rec);
-            return EFI_VOLUME_CORRUPTED;
-        }
-        /* the record we were pointed at must really carry $INDEX_ROOT:$I30 */
-        Ctx = NtfsEfiFindAttrInRecord (Vcb, Rec, AttributeIndexRoot, L"$I30", 4, NULL);
-        if (Ctx == NULL) { FreePool (Rec); return EFI_VOLUME_CORRUPTED; }
-        NtfsEfiFreeAttrCtx (Ctx);
+        ULONGLONG HostIdx;
 
-        Host->Rec = Rec; Host->MFTIndex = HostIdx; Host->Own = TRUE;
-        Host->HasAlloc = SawAlloc;
+        if (AllocMFT != (ULONGLONG)-1LL) {
+            if (BitmapMFT != (ULONGLONG)-1LL && BitmapMFT != AllocMFT) {
+                /* the mapping pairs and the allocation bitmap must be editable
+                 * together, in one record, or an insert cannot stay consistent */
+                return EFI_UNSUPPORTED;
+            }
+            HostIdx = AllocMFT;
+            Host->HasAlloc = TRUE;
+        } else {
+            HostIdx = RootMFT;
+            Host->HasAlloc = FALSE;
+        }
+
+        /* the allocation/bitmap host first */
+        if (HostIdx == BaseMFT) {
+            Host->Rec = BaseRec; Host->MFTIndex = BaseMFT; Host->Own = FALSE;
+        } else {
+            PFILE_RECORD_HEADER Rec = AllocatePool (Vcb->BytesPerFileRecord);
+            if (Rec == NULL) return EFI_OUT_OF_RESOURCES;
+            if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, HostIdx, Rec))) {
+                FreePool (Rec);
+                return EFI_VOLUME_CORRUPTED;
+            }
+            Host->Rec = Rec; Host->MFTIndex = HostIdx; Host->Own = TRUE;
+        }
+
+        /*
+         * Then the $INDEX_ROOT host. Alias the buffer we already have whenever it
+         * is the same record - two buffers for one record would each be written
+         * back whole, and the later write would drop the earlier one's edits.
+         */
+        if (RootMFT == HostIdx) {
+            Host->RootRec = Host->Rec; Host->RootMFTIndex = Host->MFTIndex; Host->RootOwn = FALSE;
+        } else if (RootMFT == BaseMFT) {
+            Host->RootRec = BaseRec; Host->RootMFTIndex = BaseMFT; Host->RootOwn = FALSE;
+        } else {
+            PFILE_RECORD_HEADER RRec = AllocatePool (Vcb->BytesPerFileRecord);
+            if (RRec == NULL) {
+                if (Host->Own) FreePool (Host->Rec);
+                Host->Rec = NULL; Host->Own = FALSE;
+                return EFI_OUT_OF_RESOURCES;
+            }
+            if (EFI_ERROR (NtfsEfiReadFileRecord (Vcb, RootMFT, RRec))) {
+                FreePool (RRec);
+                if (Host->Own) FreePool (Host->Rec);
+                Host->Rec = NULL; Host->Own = FALSE;
+                return EFI_VOLUME_CORRUPTED;
+            }
+            Host->RootRec = RRec; Host->RootMFTIndex = RootMFT; Host->RootOwn = TRUE;
+        }
+
+        /* the record we were pointed at must really carry the attribute claimed */
+        {
+            PNTFS_ATTR_CTX Chk = NtfsEfiFindAttrInRecord (Vcb, Host->RootRec,
+                                     AttributeIndexRoot, L"$I30", 4, NULL);
+            if (Chk == NULL) {                       /* list disagrees with record */
+                if (Host->RootOwn) FreePool (Host->RootRec);
+                if (Host->Own)     FreePool (Host->Rec);
+                Host->Rec = NULL; Host->RootRec = NULL;
+                Host->Own = FALSE; Host->RootOwn = FALSE;
+                return EFI_VOLUME_CORRUPTED;
+            }
+            NtfsEfiFreeAttrCtx (Chk);
+        }
         return EFI_SUCCESS;
     }
 }

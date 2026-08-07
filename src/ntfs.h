@@ -721,10 +721,27 @@ NtfsEfiMoveFile (
  * $ATTRIBUTE_LIST extension record; index writers must edit THAT record.
  * See NtfsEfiResolveIndexHost (ntfs_attr.c).
  */
+/*
+ * The $I30 attributes of one directory can live in TWO different MFT records:
+ * Windows commonly leaves $INDEX_ROOT in the base record and moves
+ * $INDEX_ALLOCATION + $BITMAP into an $ATTRIBUTE_LIST extension record. An
+ * insert has to edit both - the root for a promoted separator, the other one
+ * for the mapping pairs and the allocation bitmap - so both records are carried
+ * here, each with its own MFT index and its own ownership flag.
+ *
+ * When both attributes sit in the same record, RootRec ALIASES Rec (RootOwn is
+ * then FALSE). That aliasing is required, not incidental: two separate buffers
+ * for one record would each be written back in full and the second write would
+ * silently discard the first one's edits.
+ */
 typedef struct {
-    PFILE_RECORD_HEADER Rec;        /* record holding $INDEX_ROOT:$I30 */
+    PFILE_RECORD_HEADER Rec;        /* record holding $INDEX_ALLOCATION + $BITMAP,
+                                     * or $INDEX_ROOT when there is no allocation */
     ULONGLONG           MFTIndex;   /* its MFT index - use for WriteFileRecord */
     BOOLEAN             Own;        /* TRUE -> caller must FreePool(Rec) */
+    PFILE_RECORD_HEADER RootRec;    /* record holding $INDEX_ROOT:$I30; may alias Rec */
+    ULONGLONG           RootMFTIndex;
+    BOOLEAN             RootOwn;    /* TRUE -> caller must FreePool(RootRec) */
     BOOLEAN             HasAlloc;   /* directory already has $INDEX_ALLOCATION:$I30 */
 } NTFS_INDEX_HOST, *PNTFS_INDEX_HOST;
 
