@@ -433,9 +433,9 @@ NtfsEfiAllocateMftRecord (
             Status = NtfsEfiWriteFileRecord (Vcb, NTFS_FILE_MFT, MftRec0);
         } else {
             // Non-resident bit was set, write the specific byte
-            PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
             UCHAR Byte = 0;
-            // BmCtx was already freed, find it again
+            /* Re-find the attribute: the record may have been rewritten (MFT
+             * growth) since BmCtx was built, so its cached copy can be stale. */
             PNTFS_ATTR_CTX FreshBmCtx = NtfsEfiFindAttrInRecord (Vcb, MftRec0, AttributeBitmap, NULL, 0, NULL);
             if (FreshBmCtx != NULL) {
                 NtfsEfiReadAttr (Vcb, FreshBmCtx, *NewIndex / 8, (PCHAR)&Byte, 1);
@@ -480,6 +480,13 @@ NtfsEfiFreeMftRecord (
     if (!BmCtx->pRecord->IsNonResident) {
         PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)MftRec0 + BmOffset);
         PUCHAR            BmBuf  = (PUCHAR)BmAttr + BmAttr->Resident.ValueOffset;
+        /* Index comes from a file handle, i.e. ultimately from a directory entry
+         * on disk: keep the bit clear inside the attribute's own value */
+        if (Index / 8 >= BmAttr->Resident.ValueLength) {
+            NtfsEfiFreeAttrCtx (BmCtx);
+            FreePool (MftRec0);
+            return EFI_VOLUME_CORRUPTED;
+        }
         BmBuf[Index / 8] &= (UCHAR)~(1U << (Index % 8));
         NtfsEfiFreeAttrCtx (BmCtx);
         Status = NtfsEfiWriteFileRecord (Vcb, NTFS_FILE_MFT, MftRec0);

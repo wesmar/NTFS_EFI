@@ -1357,7 +1357,9 @@ UefiMain (
                  * be rejected (EFI_ACCESS_DENIED), not silently accepted */
                 if (!EFI_ERROR (WRoot->Open (WRoot, &WFile, L"\\write_test.txt",
                         EFI_FILE_MODE_READ, 0))) {
-                    CHAR8      Dummy[4] = "XXXX";
+                    /* exactly 4 bytes, deliberately unterminated - the Write is
+                     * expected to be refused before it ever reads the buffer */
+                    CHAR8      Dummy[4] = { 'X', 'X', 'X', 'X' };
                     UINTN      Size = 4;
                     EFI_STATUS WrStatus = WFile->Write (WFile, &Size, Dummy);
                     ProbePrint (L"    readonly-write-reject: %r (expect Access Denied)\r\n", WrStatus);
@@ -1701,7 +1703,13 @@ UefiMain (
                             /* (d) delete from split directory: should succeed if leaf, or return EFI_UNSUPPORTED if separator, but never crash */
                             {
                                 EFI_FILE_PROTOCOL *SplitDir;
-                                St = WRoot->Open (WRoot, &SplitDir, L"\\aged_dir", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+                                /* \copied\many_split is the 62-entry fixture the copy test
+                                 * above lays down: a real INDX-split directory that actually holds
+                                 * these synth_entry_* names. This used to open \aged_dir, whose
+                                 * files are named aged_NNN_*.dat, so both opens below could only
+                                 * ever report Not Found - a stale test expectation, not a driver
+                                 * fault. */
+                                St = WRoot->Open (WRoot, &SplitDir, L"\\copied\\many_split", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
                                 if (!EFI_ERROR (St)) {
                                     EFI_FILE_PROTOCOL *DelFile;
                                     St = SplitDir->Open (SplitDir, &DelFile, L"synth_entry_20_reasonably_long_filename.txt",
@@ -1796,6 +1804,11 @@ UefiMain (
                                                 if (Fi->FileName[0] == L'.' &&
                                                     (Fi->FileName[1] == L'\0' ||
                                                      (Fi->FileName[1] == L'.' && Fi->FileName[2] == L'\0'))) continue;
+                                                /* count only what the drain loop above actually deletes: it
+                                                 * skips subdirectories on purpose, so counting them as
+                                                 * survivors made a fully drained directory still report
+                                                 * remaining=<number of subdirs>. */
+                                                if (Fi->Attribute & EFI_FILE_DIRECTORY) continue;
                                                 Remaining++;
                                             }
                                             Dir->Close (Dir);

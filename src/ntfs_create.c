@@ -191,8 +191,12 @@ NtfsInsertIntoIndexAllocationNode (
     }
 
     Block = (PINDEX_BUFFER)IndexBuf;
+    /* NtfsInsertIntoIndexEntries below shifts bytes forward inside this buffer
+     * using Header.AllocatedSize as its room check - all three header fields
+     * are on-disk data, so they get validated before any of that */
     if (Block->Ntfs.Type != NRH_INDX_TYPE ||
-        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) {
+        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block)) {
         FreePool (IndexBuf);
         return EFI_VOLUME_CORRUPTED;
     }
@@ -579,14 +583,23 @@ NtfsBtreeInsertRec (
     EFI_STATUS             Status;
 
     *DidSplit = FALSE;
-    if (Depth > 24) return EFI_UNSUPPORTED;   /* pathological tree height guard */
+    /*
+     * Height guard. Every level of this recursion carries an Ord[512] pointer
+     * array (4 KiB) plus a ~600-byte separator buffer ON THE STACK, so the old
+     * limit of 24 allowed ~120 KiB of stack - more than a DXE-phase driver can
+     * assume it has. A B+tree of 4 KiB index blocks holds tens of entries per
+     * node, so depth 12 already covers directories with billions of entries;
+     * anything deeper is a corrupt/looping index, not a real directory.
+     */
+    if (Depth > 12) return EFI_UNSUPPORTED;
 
     NodeBuf = AllocatePool (Vcb->BytesPerIndexRecord);
     if (NodeBuf == NULL) return EFI_OUT_OF_RESOURCES;
     if (NtfsEfiReadAttr (Vcb, AllocCtx, NodeVCN * Vcb->BytesPerCluster,
                          (PCHAR)NodeBuf, Vcb->BytesPerIndexRecord) != Vcb->BytesPerIndexRecord ||
         ((PINDEX_BUFFER)NodeBuf)->Ntfs.Type != NRH_INDX_TYPE ||
-        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &((PINDEX_BUFFER)NodeBuf)->Ntfs))) {
+        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &((PINDEX_BUFFER)NodeBuf)->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, (PINDEX_BUFFER)NodeBuf)) {
         FreePool (NodeBuf);
         return EFI_VOLUME_CORRUPTED;
     }
@@ -827,10 +840,13 @@ NtfsBtreePushDownRoot (
     R    = (PINDEX_ENTRY_ATTRIBUTE)Temp;
     REnd = (PINDEX_ENTRY_ATTRIBUTE)(Temp + EntriesBytes);
     while ((PUCHAR)R < (PUCHAR)REnd) {
+        if (R->Length == 0) { FreePool (Temp); return EFI_VOLUME_CORRUPTED; }
         if (R->Flags & NTFS_INDEX_ENTRY_END) break;
+        if (NOrd >= 510) { FreePool (Temp); return EFI_UNSUPPORTED; }
         Ord[NOrd++] = R;
         R = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)R + R->Length);
     }
+    if ((PUCHAR)R >= (PUCHAR)REnd) { FreePool (Temp); return EFI_VOLUME_CORRUPTED; }
     RootEndSub = (INT64)NTFS_ENTRY_SUBVCN (R);
 
     /* shrink the root in place to {END+NODE->placeholder} */
@@ -916,6 +932,12 @@ NtfsInsertIndexAllocationEntry (
 
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx == NULL) return EFI_UNSUPPORTED;
+    /* everything below derives entry pointers and shift lengths from this
+     * header's on-disk offsets - reject an implausible one up front */
+    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+        NtfsEfiFreeAttrCtx (RootCtx);
+        return EFI_VOLUME_CORRUPTED;
+    }
     NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexAllocation, L"$I30", 4, &AllocOffset);
     NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeBitmap, L"$I30", 4, &BitmapOffset);
     NtfsEfiFreeAttrCtx (RootCtx);
@@ -1573,9 +1595,17 @@ NtfsInsertIndexEntrySmall (
 
     if (RootCtx == NULL) return EFI_UNSUPPORTED;   /* resolver guarantees otherwise */
 
-    if (EntryLen + 16 > sizeof (NewEntryBuf)) {
+    /* EntryLen (the 8-aligned entry size) is what gets zeroed and copied below,
+     * so that - not 16+KeyLen+16 - is the buffer requirement. The old check
+     * added a spurious extra 16 bytes and rejected creates with names of ~247
+     * chars and up even though the entry fit. */
+    if (EntryLen > sizeof (NewEntryBuf)) {
         NtfsEfiFreeAttrCtx (RootCtx);
         return EFI_UNSUPPORTED;   /* pathological name length */
+    }
+    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+        NtfsEfiFreeAttrCtx (RootCtx);
+        return EFI_VOLUME_CORRUPTED;
     }
 
     RootAttr  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
@@ -1635,7 +1665,7 @@ NtfsInsertIndexEntrySmall (
     if (!NtfsEfiGrowResidentInRecord (Vcb, DirRec, RootOffset, NewValueLen)) {
         EFI_STATUS ConvertStatus;
 
-        ZeroMem (NewEntry, (UINTN)(16 + KeyLen));
+        ZeroMem (NewEntry, (UINTN)EntryLen);   /* whole entry incl. 8-align padding */
         NewEntry->Data.Directory.IndexedFile = ChildRef;
         NewEntry->Length    = (USHORT)EntryLen;
         NewEntry->KeyLength = (USHORT)KeyLen;
@@ -1658,7 +1688,7 @@ NtfsInsertIndexEntrySmall (
 
     NtfsEfiShiftForward (ValPtr + InsertOffset, (UINTN)(OldValueLen - InsertOffset), (UINTN)EntryLen);
 
-    ZeroMem (NewEntry, (UINTN)(16 + KeyLen));
+    ZeroMem (NewEntry, (UINTN)EntryLen);   /* whole entry incl. 8-align padding */
     NewEntry->Data.Directory.IndexedFile = ChildRef;
     NewEntry->Length    = (USHORT)EntryLen;
     NewEntry->KeyLength = (USHORT)KeyLen;

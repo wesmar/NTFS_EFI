@@ -84,18 +84,25 @@ NtfsEfiCreateHandle (
     FnCtx = NtfsEfiFindAttribute (Vcb, Rec, AttributeFileName, NULL, 0, NULL);
     if (FnCtx != NULL) {
         ULONG FnLen = (ULONG)NtfsEfiAttrDataLength (FnCtx);
-        FnAttr = AllocatePool (FnLen);
+        /* FnLen is the attribute's own declared length and FnAttr->NameLength is
+         * a separate on-disk byte: a record where NameLength claims more chars
+         * than the attribute holds made the CopyMem below read past this heap
+         * buffer. Require the whole fixed part plus the name to be present. */
+        FnAttr = (FnLen >= NTFS_FILENAME_FIXED_BYTES) ? AllocatePool (FnLen) : NULL;
         if (FnAttr != NULL) {
-            NtfsEfiReadAttr (Vcb, FnCtx, 0, (PCHAR)FnAttr, FnLen);
-            Handle->FileNameChars = FnAttr->NameLength;
-            if (Handle->FileNameChars > 255) Handle->FileNameChars = 255;
-            CopyMem (Handle->FileName, FnAttr->Name,
-                     Handle->FileNameChars * sizeof (WCHAR));
-            Handle->FileName[Handle->FileNameChars] = L'\0';
-            /* use $FILE_NAME sizes as fallback for directories */
-            if (Handle->IsDirectory) {
-                Handle->FileSize  = FnAttr->DataSize;
-                Handle->AllocSize = FnAttr->AllocatedSize;
+            if (NtfsEfiReadAttr (Vcb, FnCtx, 0, (PCHAR)FnAttr, FnLen) == FnLen &&
+                (UINT64)NTFS_FILENAME_FIXED_BYTES +
+                    (UINT64)FnAttr->NameLength * sizeof (WCHAR) <= (UINT64)FnLen) {
+                Handle->FileNameChars = FnAttr->NameLength;
+                if (Handle->FileNameChars > 255) Handle->FileNameChars = 255;
+                CopyMem (Handle->FileName, FnAttr->Name,
+                         Handle->FileNameChars * sizeof (WCHAR));
+                Handle->FileName[Handle->FileNameChars] = L'\0';
+                /* use $FILE_NAME sizes as fallback for directories */
+                if (Handle->IsDirectory) {
+                    Handle->FileSize  = FnAttr->DataSize;
+                    Handle->AllocSize = FnAttr->AllocatedSize;
+                }
             }
             FreePool (FnAttr);
         }
@@ -298,7 +305,9 @@ NtfsEfiParentOf (
         FnCtx = NtfsEfiFindAttribute (Vcb, Rec, AttributeFileName, NULL, 0, NULL);
         if (FnCtx != NULL) {
             FnLen = (ULONG)NtfsEfiAttrDataLength (FnCtx);
-            FnAttr = AllocatePool (FnLen);
+            /* only the parent reference (first 8 bytes) is read here, but the
+             * attribute still has to be a plausible $FILE_NAME value */
+            FnAttr = (FnLen >= NTFS_FILENAME_FIXED_BYTES) ? AllocatePool (FnLen) : NULL;
             if (FnAttr != NULL) {
                 if (NtfsEfiReadAttr (Vcb, FnCtx, 0, (PCHAR)FnAttr, FnLen) == FnLen) {
                     Parent = FnAttr->DirectoryFileReferenceNumber & NTFS_MFT_MASK;
@@ -736,6 +745,11 @@ NtfsSyncFileNameSize (
     return ParentRef;
 }
 
+/* An INDX node's child VCNs are on-disk data and can point back at an
+ * ancestor on a corrupt index; without a cap this descent recurses until the
+ * stack or the pool runs out. Same bound the ntfs_delete.c walkers use. */
+#define NTFS_MAX_INDEX_DEPTH 32
+
 static BOOLEAN
 NtfsPatchIndexAllocationEntrySize (
     IN PNTFS_EFI_VCB  Vcb,
@@ -743,13 +757,16 @@ NtfsPatchIndexAllocationEntrySize (
     IN ULONGLONG      VCN,
     IN ULONGLONG      ChildMFT,
     IN UINT64         DataSize,
-    IN UINT64         AllocSize
+    IN UINT64         AllocSize,
+    IN ULONG          Depth
     )
 {
     PUCHAR                 IndexBuf;
     PINDEX_BUFFER          Block;
     PINDEX_ENTRY_ATTRIBUTE Entry, Last;
     BOOLEAN                Patched = FALSE;
+
+    if (Depth >= NTFS_MAX_INDEX_DEPTH) return FALSE;
 
     IndexBuf = AllocatePool (Vcb->BytesPerIndexRecord);
     if (IndexBuf == NULL) return FALSE;
@@ -762,7 +779,8 @@ NtfsPatchIndexAllocationEntrySize (
 
     Block = (PINDEX_BUFFER)IndexBuf;
     if (Block->Ntfs.Type != NRH_INDX_TYPE ||
-        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) {
+        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block)) {
         FreePool (IndexBuf);
         return FALSE;
     }
@@ -783,10 +801,11 @@ NtfsPatchIndexAllocationEntrySize (
             break;
         }
 
-        if (Entry->Flags & NTFS_INDEX_ENTRY_NODE) {
+        if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) &&
+            Entry->Length >= sizeof (ULONGLONG)) {
             ULONGLONG SubVCN = *(PULONGLONG)((PUCHAR)Entry + Entry->Length - sizeof (ULONGLONG));
             Patched = NtfsPatchIndexAllocationEntrySize (Vcb, IndexAllocCtx, SubVCN,
-                          ChildMFT, DataSize, AllocSize);
+                          ChildMFT, DataSize, AllocSize, Depth + 1);
             if (Patched) break;
         }
 
@@ -846,6 +865,11 @@ NtfsSyncParentIndexEntrySize (
                         AttributeIndexAllocation, L"$I30", 4, NULL);
 
     RootAttr  = (PNTFS_ATTR_RECORD)((PUCHAR)ParentRec + RootOffset);
+    if (!NtfsEfiIndexRootOk (RootAttr)) {
+        if (IndexAllocCtx) NtfsEfiFreeAttrCtx (IndexAllocCtx);
+        FreePool (ParentRec);
+        return;
+    }
     IndexRoot = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RootAttr + RootAttr->Resident.ValueOffset);
     Entry = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.FirstEntryOffset);
     Last  = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header + IndexRoot->Header.TotalSizeOfEntries);
@@ -864,10 +888,11 @@ NtfsSyncParentIndexEntrySize (
             return;
         }
 
-        if (IndexAllocCtx != NULL && (Entry->Flags & NTFS_INDEX_ENTRY_NODE)) {
+        if (IndexAllocCtx != NULL && (Entry->Flags & NTFS_INDEX_ENTRY_NODE) &&
+            Entry->Length >= sizeof (ULONGLONG)) {
             ULONGLONG SubVCN = *(PULONGLONG)((PUCHAR)Entry + Entry->Length - sizeof (ULONGLONG));
             if (NtfsPatchIndexAllocationEntrySize (Vcb, IndexAllocCtx, SubVCN,
-                    ChildMFT, DataSize, AllocSize)) {
+                    ChildMFT, DataSize, AllocSize, 0)) {
                 NtfsEfiFreeAttrCtx (IndexAllocCtx);
                 FreePool (ParentRec);
                 return;

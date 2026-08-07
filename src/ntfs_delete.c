@@ -210,7 +210,8 @@ NtfsFreeIndexSubtree (
         goto FreeAndClear;
     Block = (PINDEX_BUFFER)Buf;
     if (Block->Ntfs.Type != NRH_INDX_TYPE ||
-        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs)))
+        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block))
         goto FreeAndClear;
 
     E    = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
@@ -271,7 +272,8 @@ NtfsExtractMaxKey (
     }
     Block = (PINDEX_BUFFER)Buf;
     if (Block->Ntfs.Type != NRH_INDX_TYPE ||
-        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) {
+        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block)) {
         FreePool (Buf); return EFI_VOLUME_CORRUPTED;
     }
 
@@ -370,7 +372,8 @@ NtfsSubtreeIsEmpty (
     }
     Block = (PINDEX_BUFFER)Buf;
     if (Block->Ntfs.Type != NRH_INDX_TYPE ||
-        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) {
+        EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block)) {
         FreePool (Buf); return TRUE;
     }
 
@@ -418,6 +421,10 @@ NtfsCollapseIndexToResident (
 
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx == NULL) return;
+    if (!NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+        NtfsEfiFreeAttrCtx (RootCtx);
+        return;
+    }
 
     RootAttr   = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
     ValPtr     = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
@@ -532,6 +539,13 @@ NtfsRemoveOneDirEntryByChild (
 
     /* --- 1. resident $INDEX_ROOT --- */
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    if (RootCtx != NULL &&
+        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+        NtfsEfiFreeAttrCtx (RootCtx);
+        RootCtx = NULL;            /* Done: frees it again otherwise */
+        Status = EFI_VOLUME_CORRUPTED;
+        goto Done;
+    }
     if (RootCtx != NULL) {
         RootAttr  = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
         ValPtr    = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
@@ -639,6 +653,7 @@ NtfsRemoveOneDirEntryByChild (
             Block = (PINDEX_BUFFER)Buf;
             if (Block->Ntfs.Type != NRH_INDX_TYPE) continue;
             if (EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) continue;
+            if (!NtfsEfiIndexBlockOk (Vcb, Block)) continue;
 
             E  = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
             L2 = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
@@ -787,17 +802,29 @@ NtfsFreeAttributeListRecords (
     if (ListCtx == NULL) return;                 /* no $ATTRIBUTE_LIST: nothing to do */
 
     ListLen = NtfsEfiAttrDataLength (ListCtx);
+    /* declared length is on-disk data: bound it before it becomes an
+     * AllocatePool size, and refuse a short read rather than walking
+     * uninitialised pool memory as if it were list items */
+    if (ListLen < sizeof (NTFS_ATTR_LIST_ITEM) || ListLen > (UINT64)(1024 * 1024)) {
+        NtfsEfiFreeAttrCtx (ListCtx);
+        return;
+    }
     ListBuf = AllocatePool ((UINTN)ListLen);
     if (ListBuf == NULL) { NtfsEfiFreeAttrCtx (ListCtx); return; }
-    NtfsEfiReadAttr (Vcb, ListCtx, 0, (PCHAR)ListBuf, (ULONG)ListLen);
+    if (NtfsEfiReadAttr (Vcb, ListCtx, 0, (PCHAR)ListBuf, (ULONG)ListLen) != (ULONG)ListLen) {
+        FreePool (ListBuf); NtfsEfiFreeAttrCtx (ListCtx);
+        return;
+    }
     NtfsEfiFreeAttrCtx (ListCtx);
 
     /* collect the distinct extension records (skip the base itself) */
     Item = (PNTFS_ATTR_LIST_ITEM)ListBuf;
     End  = (PNTFS_ATTR_LIST_ITEM)(ListBuf + ListLen);
-    while (Item < End && Item->Type != (ULONG)AttributeEnd) {
+    while ((PUCHAR)Item + sizeof (NTFS_ATTR_LIST_ITEM) <= (PUCHAR)End &&
+           Item->Type != (ULONG)AttributeEnd) {
         ULONGLONG Idx;
-        if (Item->Length == 0) break;
+        if (Item->Length < sizeof (NTFS_ATTR_LIST_ITEM) ||
+            (PUCHAR)Item + Item->Length > (PUCHAR)End) break;
         Idx = Item->MFTIndex & NTFS_MFT_MASK;
         if (Idx != BaseMFT) {
             BOOLEAN Dup = FALSE;
@@ -851,6 +878,14 @@ NtfsDirectoryIsEmpty (
     Rec = Host.Rec;
 
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, Rec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    if (RootCtx != NULL &&
+        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)Rec + RootOffset))) {
+        /* fail closed, like the rest of this function: an index we cannot
+         * trust must never read as "empty" (that would orphan children) */
+        NtfsEfiFreeAttrCtx (RootCtx);
+        if (Host.Own) FreePool (Host.Rec);
+        return FALSE;
+    }
     if (RootCtx != NULL) {
         PNTFS_ATTR_RECORD RootAttr = (PNTFS_ATTR_RECORD)((PUCHAR)Rec + RootOffset);
         PUCHAR ValPtr = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
@@ -886,6 +921,7 @@ NtfsDirectoryIsEmpty (
                 Block = (PINDEX_BUFFER)Buf;
                 if (Block->Ntfs.Type != NRH_INDX_TYPE) continue;
                 if (EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) continue;
+                if (!NtfsEfiIndexBlockOk (Vcb, Block)) continue;
                 E  = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
                 L2 = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
                 while ((PUCHAR)E < (PUCHAR)L2) {

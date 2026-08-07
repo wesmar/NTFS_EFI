@@ -400,6 +400,16 @@ typedef struct {
 #define FILE_RECORD_END  0x11477982UL
 #define ATTR_RECORD_ALIGNMENT 8
 
+/* Smallest legal attribute record: Type..Instance (16 bytes) plus the shorter
+ * of the two sub-headers (resident, 8 bytes). Anything below this cannot even
+ * hold the fields the attribute walk reads, so it is corruption. */
+#define NTFS_ATTR_MIN_HEADER 24
+
+/* FILENAME_ATTRIBUTE up to (not including) Name[0]: everything before the
+ * variable-length name. A $FILE_NAME value shorter than this cannot be read
+ * at all; the name needs NameLength * sizeof(WCHAR) more bytes on top. */
+#define NTFS_FILENAME_FIXED_BYTES 66
+
 /* =========================================================================
  * Section 3 - driver-internal structures
  * ========================================================================= */
@@ -780,6 +790,31 @@ EFI_STATUS
 NtfsEfiFixupRecord (
     IN PNTFS_EFI_VCB       Vcb,
     IN NTFS_RECORD_HEADER *Hdr
+    );
+
+/*
+ * Sanity-check an index header's FirstEntryOffset/TotalSizeOfEntries/
+ * AllocatedSize against the buffer it lives in, BEFORE deriving First/Last
+ * walk pointers or using AllocatedSize as an insert room-check. All three are
+ * untrusted on-disk data. Avail = bytes from Header to end of its buffer.
+ */
+BOOLEAN
+NtfsEfiIndexHeaderOk (
+    IN INDEX_HEADER_ATTRIBUTE *Header,
+    IN UINT64                  Avail
+    );
+
+/* Same, for a whole INDX block read into a Vcb->BytesPerIndexRecord buffer. */
+BOOLEAN
+NtfsEfiIndexBlockOk (
+    IN PNTFS_EFI_VCB Vcb,
+    IN PINDEX_BUFFER Block
+    );
+
+/* Same, for a resident $INDEX_ROOT attribute record inside an MFT record. */
+BOOLEAN
+NtfsEfiIndexRootOk (
+    IN PNTFS_ATTR_RECORD RootAttr
     );
 
 EFI_STATUS

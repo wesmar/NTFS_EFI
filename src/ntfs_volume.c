@@ -318,9 +318,22 @@ NtfsEfiMountVolume (
                 PNTFS_ATTR_CTX VnCtx = NtfsEfiFindAttribute (Vcb, VolumeRec,
                                             AttributeVolumeName, NULL, 0, NULL);
                 if (VnCtx != NULL) {
+                    /*
+                     * LabelBytes is $VOLUME_NAME's declared value length, i.e.
+                     * on-disk data - it must be clamped to the DESTINATION size
+                     * before the read, not just when placing the terminator.
+                     * Vcb->VolumeLabel is a fixed WCHAR[128] inside the VCB, and
+                     * a label attribute claiming more (up to the ~1 KB an MFT
+                     * record can hold) overwrote the VCB fields that follow it -
+                     * MasterFileTable and MFTContext are the very next members,
+                     * so a hand-edited/corrupt $Volume record could plant
+                     * arbitrary pointers into the mounted volume state.
+                     */
                     ULONG LabelBytes = (ULONG)NtfsEfiAttrDataLength (VnCtx);
-                    ULONG LabelChars = LabelBytes / sizeof (WCHAR);
-                    if (LabelChars > 127) LabelChars = 127;
+                    ULONG LabelChars;
+                    ULONG MaxBytes = (ULONG)(sizeof (Vcb->VolumeLabel) - sizeof (WCHAR));
+                    if (LabelBytes > MaxBytes) LabelBytes = MaxBytes;
+                    LabelChars = LabelBytes / sizeof (WCHAR);
                     NtfsEfiReadAttr (Vcb, VnCtx, 0, (PCHAR)Vcb->VolumeLabel, LabelBytes);
                     Vcb->VolumeLabel[LabelChars] = L'\0';
                     Vcb->VolumeLabelLen = (USHORT)LabelChars;
@@ -445,7 +458,10 @@ NtfsSetVolumeDirty (
 
     {
         PNTFS_ATTR_RECORD Attr = (PNTFS_ATTR_RECORD)((PUCHAR)VolumeRec + AttrOffset);
-        if (!Attr->IsNonResident) {
+        /* the dirty flag is the USHORT at value offset 10 (NTFS_VOLUME_INFORMATION
+         * .VolumeFlags) - only touch it when the value really is that long */
+        if (!Attr->IsNonResident &&
+            Attr->Resident.ValueLength >= sizeof (NTFS_VOLUME_INFORMATION)) {
             PUCHAR Val = (PUCHAR)Attr + Attr->Resident.ValueOffset;
             PUSHORT FlagsPtr = (PUSHORT)(Val + 10);
             USHORT OldFlags = *FlagsPtr;

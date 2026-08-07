@@ -17,6 +17,7 @@
 static PUCHAR
 NtfsDecodeRunEntry (
     IN  PUCHAR     DataRun,
+    IN  PUCHAR     RunEnd,       /* first byte past the mapping-pairs stream */
     OUT LONGLONG  *OutOffset,    /* delta LCN; meaningless if *OutIsSparse   */
     OUT UINT64    *OutLength,    /* run length in clusters                  */
     OUT BOOLEAN   *OutIsSparse
@@ -29,6 +30,18 @@ NtfsDecodeRunEntry (
     *OutLength = 0;
     *OutOffset = 0;
     *OutIsSparse = (OffBytes == 0);
+
+    /*
+     * LenBytes/OffBytes are 4-bit fields, so on-disk they can say 9..15 even
+     * though a 64-bit VCN/LCN never needs more than 8 bytes. Left as-is, the
+     * shift loops below do `<< (i*8)` with i*8 >= 64 (undefined behaviour) and
+     * read up to 31 bytes from a buffer that only holds this one attribute
+     * record. Reject the malformed header instead, and refuse any run whose
+     * bytes do not all lie before RunEnd - callers see it as a short/failed
+     * run list rather than reading past the allocation.
+     */
+    if (LenBytes > 8 || OffBytes > 8) return NULL;
+    if (DataRun + 1 + (UINTN)LenBytes + (UINTN)OffBytes > RunEnd) return NULL;
     DataRun++;
 
     for (i = 0; i < LenBytes; i++) {
@@ -63,8 +76,26 @@ NtfsBuildRunList (
     INT64    CurrentLCN = 0;
     UINT64   CurrentVBN = AttrRecord->NonResident.LowestVCN;
     ULONG    Count      = 0;
+    PUCHAR   RunEnd;
+
+    *RunCount = 0;
+
+    /*
+     * MappingPairsOffset is on-disk data and the buffer this decodes from is a
+     * heap copy of exactly AttrRecord->Length bytes (NtfsEfiPrepareAttrCtx).
+     * An offset past that length made the very first *DataRun read land outside
+     * the allocation; the terminator-only `while (*DataRun != 0)` loop below
+     * then walked heap memory until it happened to hit a zero byte. Anchor both
+     * the start and the end of the stream to the attribute's own length.
+     */
+    if (!AttrRecord->IsNonResident) return EFI_VOLUME_CORRUPTED;
+    if (AttrRecord->Length < NTFS_ATTR_MIN_HEADER ||
+        (ULONG)AttrRecord->NonResident.MappingPairsOffset >= AttrRecord->Length) {
+        return EFI_VOLUME_CORRUPTED;
+    }
 
     DataRun = (PUCHAR)AttrRecord + AttrRecord->NonResident.MappingPairsOffset;
+    RunEnd  = (PUCHAR)AttrRecord + AttrRecord->Length;
 
     {
         /* clamp the debug dump to the attribute's own bounds - the
@@ -82,11 +113,12 @@ NtfsBuildRunList (
         }
     }
 
-    while (*DataRun != 0) {
+    while (DataRun < RunEnd && *DataRun != 0) {
         if (Count >= MaxRuns) {
             return EFI_BUFFER_TOO_SMALL;
         }
-        DataRun = NtfsDecodeRunEntry (DataRun, &DeltaLCN, &RunLen, &IsSparse);
+        DataRun = NtfsDecodeRunEntry (DataRun, RunEnd, &DeltaLCN, &RunLen, &IsSparse);
+        if (DataRun == NULL) return EFI_VOLUME_CORRUPTED;
 
         if (IsSparse) {
             Runs[Count].LBN = -1LL; /* sparse */
@@ -104,20 +136,33 @@ NtfsBuildRunList (
 }
 
 /* Byte length of an attribute's mapping-pairs stream, INCLUDING the
- * terminating 0x00, starting at AttrRecord->NonResident.MappingPairsOffset. */
+ * terminating 0x00, starting at AttrRecord->NonResident.MappingPairsOffset.
+ * Returns 0 when the stream is malformed or runs past the attribute record
+ * (same untrusted-offset reasoning as NtfsBuildRunList above). */
 UINTN
 NtfsMappingPairsSize (
     IN PNTFS_ATTR_RECORD AttrRecord
     )
 {
-    PUCHAR p = (PUCHAR)AttrRecord + AttrRecord->NonResident.MappingPairsOffset;
-    PUCHAR start = p;
+    PUCHAR p, start, end;
 
-    while (*p != 0) {
+    if (!AttrRecord->IsNonResident ||
+        AttrRecord->Length < NTFS_ATTR_MIN_HEADER ||
+        (ULONG)AttrRecord->NonResident.MappingPairsOffset >= AttrRecord->Length) {
+        return 0;
+    }
+
+    p     = (PUCHAR)AttrRecord + AttrRecord->NonResident.MappingPairsOffset;
+    start = p;
+    end   = (PUCHAR)AttrRecord + AttrRecord->Length;
+
+    while (p < end && *p != 0) {
         UCHAR LenBytes = *p & 0x0F;
         UCHAR OffBytes = (*p >> 4) & 0x0F;
+        if (LenBytes > 8 || OffBytes > 8) return 0;
         p += 1 + LenBytes + OffBytes;
     }
+    if (p >= end) return 0;          /* no terminator inside the attribute */
     return (UINTN)(p - start) + 1;   /* +1 for the terminator itself */
 }
 

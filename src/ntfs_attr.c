@@ -27,7 +27,23 @@ NtfsEfiPrepareAttrCtx (
     IN ULONGLONG          FileMFTIndex
     )
 {
-    PNTFS_ATTR_CTX Ctx = NtfsEfiAllocAttrCtx ();
+    PNTFS_ATTR_CTX Ctx;
+
+    /*
+     * Callers have already checked that Length fits inside the source record
+     * (NtfsEfiFindAttrInRecord). Re-check the value bounds a RESIDENT attribute
+     * declares, because the heap copy taken below is exactly Length bytes and
+     * NtfsEfiReadAttr's resident branch reads at ValueOffset+ValueLength inside
+     * it - both fields are on-disk data and nothing else validates them.
+     */
+    if (AttrRecord->Length < NTFS_ATTR_MIN_HEADER) return NULL;
+    if (!AttrRecord->IsNonResident &&
+        (UINT64)AttrRecord->Resident.ValueOffset + AttrRecord->Resident.ValueLength
+            > (UINT64)AttrRecord->Length) {
+        return NULL;
+    }
+
+    Ctx = NtfsEfiAllocAttrCtx ();
     if (Ctx == NULL) return NULL;
 
     Ctx->pRecord = AllocatePool (AttrRecord->Length);
@@ -267,8 +283,28 @@ NtfsEfiFindAttrInRecord (
 
     (VOID)Vcb;
 
-    while (Attr < LastPtr && Attr->Type != (ULONG)AttributeEnd) {
-        if (Attr->Length == 0) break;
+    /*
+     * Attr->Length is a 32-bit field read straight off the disk, and it is used
+     * BOTH to step to the next attribute and (in NtfsEfiPrepareAttrCtx below) as
+     * an AllocatePool+CopyMem size. Checking only for 0 - enough to stop the
+     * walk looping forever - still let a record whose attribute claimed a length
+     * larger than the record itself copy far past the end of the record buffer.
+     * This function is the central attribute lookup (every file operation goes
+     * through it), so validate here, once: minimum header size, and the whole
+     * attribute (plus its name) inside the record's in-use area. Same shape as
+     * the check NtfsEfiSelectNameInRecord in ntfs_file.c already does.
+     */
+    while ((PUCHAR)Attr + NTFS_ATTR_MIN_HEADER <= (PUCHAR)LastPtr &&
+           Attr->Type != (ULONG)AttributeEnd) {
+        if (Attr->Length < NTFS_ATTR_MIN_HEADER ||
+            (PUCHAR)Attr + Attr->Length > (PUCHAR)LastPtr) {
+            break;
+        }
+        if (Attr->NameLength != 0 &&
+            (UINT64)Attr->NameOffset + (UINT64)Attr->NameLength * sizeof (WCHAR)
+                > (UINT64)Attr->Length) {
+            break;
+        }
 
         if (Attr->Type == (ULONG)Type && Attr->NameLength == NameLength) {
             BOOLEAN NameMatch = TRUE;
@@ -316,24 +352,50 @@ NtfsEfiFindAttribute (
 
     {
         UINT64             ListLen  = NtfsEfiAttrDataLength (ListCtx);
-        PUCHAR             ListBuf  = AllocatePool ((UINTN)ListLen);
+        PUCHAR             ListBuf;
+        PUCHAR             ListEnd;
         PNTFS_ATTR_LIST_ITEM Item;
-        PNTFS_ATTR_LIST_ITEM ListEnd;
 
+        /* ListLen is the attribute's declared data size, i.e. on-disk data:
+         * bound it before it becomes an AllocatePool size, exactly as
+         * NtfsEfiResolveIndexHost below already does. */
+        if (ListLen < sizeof (NTFS_ATTR_LIST_ITEM) || ListLen > (UINT64)(1024 * 1024)) {
+            NtfsEfiFreeAttrCtx (ListCtx);
+            return NULL;
+        }
+        ListBuf = AllocatePool ((UINTN)ListLen);
         if (ListBuf == NULL) { NtfsEfiFreeAttrCtx (ListCtx); return NULL; }
-        NtfsEfiReadAttr (Vcb, ListCtx, 0, (PCHAR)ListBuf, (ULONG)ListLen);
+        /* a short read would leave the tail of ListBuf uninitialised and the
+         * loop below would then parse whatever the pool handed us */
+        if (NtfsEfiReadAttr (Vcb, ListCtx, 0, (PCHAR)ListBuf, (ULONG)ListLen) != (ULONG)ListLen) {
+            FreePool (ListBuf);
+            NtfsEfiFreeAttrCtx (ListCtx);
+            return NULL;
+        }
         NtfsEfiFreeAttrCtx (ListCtx);
 
         Item    = (PNTFS_ATTR_LIST_ITEM)ListBuf;
-        ListEnd = (PNTFS_ATTR_LIST_ITEM)(ListBuf + ListLen);
+        ListEnd = ListBuf + ListLen;
 
-        while (Item < ListEnd && Item->Type != (ULONG)AttributeEnd) {
+        /* every field read below must be inside the buffer: the whole fixed
+         * part of the item, its Length (which advances the walk), and the name
+         * bytes at NameOffset */
+        while ((PUCHAR)Item + sizeof (NTFS_ATTR_LIST_ITEM) <= ListEnd &&
+               Item->Type != (ULONG)AttributeEnd) {
+            if (Item->Length < sizeof (NTFS_ATTR_LIST_ITEM) ||
+                (PUCHAR)Item + Item->Length > ListEnd) {
+                break;
+            }
             if (Item->Type == (ULONG)Type && Item->NameLength == NameLength) {
                 BOOLEAN NameMatch = TRUE;
                 if (NameLength > 0) {
                     PWCHAR AttrName = (PWCHAR)((PUCHAR)Item + Item->NameOffset);
-                    if (CompareMem (AttrName, Name, NameLength * sizeof (WCHAR)) != 0)
+                    if ((PUCHAR)Item + Item->NameOffset +
+                            (UINTN)NameLength * sizeof (WCHAR) > ListEnd) {
                         NameMatch = FALSE;
+                    } else if (CompareMem (AttrName, Name, NameLength * sizeof (WCHAR)) != 0) {
+                        NameMatch = FALSE;
+                    }
                 }
                 if (NameMatch) {
                     ULONGLONG      RemoteIdx = Item->MFTIndex & NTFS_MFT_MASK;
@@ -347,7 +409,6 @@ NtfsEfiFindAttribute (
                     if (Ctx != NULL) { FreePool (ListBuf); return Ctx; }
                 }
             }
-            if (Item->Length == 0) break;
             Item = (PNTFS_ATTR_LIST_ITEM)((PUCHAR)Item + Item->Length);
         }
         FreePool (ListBuf);

@@ -1,25 +1,15 @@
 /**
- * ntfs_setinfo.c - everything EFI_FILE_PROTOCOL.SetInfo(EFI_FILE_INFO) can
- * change on an existing file, in one place:
- *   - timestamps + DOS attributes      NtfsEfiSetFileInfo
- *   - rename in place                  NtfsEfiRenameFile (wrapper)
- *   - cross-directory move             NtfsEfiMoveFile
- *   - shrink / truncate FileSize       NtfsEfiSetFileSize
- *   - release prealloc slack on close  NtfsEfiTrimAllocation
+ * ntfs_setinfo.c - EFI_FILE_PROTOCOL.SetInfo(EFI_FILE_INFO): timestamps and
+ * DOS attributes. (Rename and FileSize/resize are separate, later steps.)
  *
- * The unifying problem all five solve: NTFS duplicates a file's times, sizes
- * and attribute bits in three places, and chkdsk cross-checks all three. Every
- * mutation here therefore lands in ALL of:
+ * The three timestamps a caller can set (CreateTime, LastAccessTime,
+ * ModificationTime) plus the DOS attribute bits are written to ALL of the
+ * places NTFS duplicates them, so chkdsk's cross-checks stay happy:
  *   - the file's own $STANDARD_INFORMATION,
  *   - the file's own $FILE_NAME,
- *   - the $FILE_NAME copy embedded in the parent directory's index entry
- *     (NtfsPatchParentIndexEntry walks $INDEX_ROOT and the INDX blocks).
- * A zero EFI_TIME (Year == 0) means "leave this timestamp unchanged", per the
- * UEFI spec.
- *
- * Limits: FileSize is shrink-only (growing is done by writing, which zero-fills
- * correctly); moves reject collisions and directory cycles (NtfsMoveWouldCycle);
- * the metadata files below NTFS_FILE_FIRST_USER_FILE are off limits.
+ *   - the $FILE_NAME copy embedded in the parent directory's index entry.
+ * A zero EFI_TIME (Year == 0) means "leave this timestamp unchanged", per
+ * the UEFI spec.
  */
 
 #include "ntfs.h"
@@ -79,6 +69,11 @@ NtfsPatchParentIndexEntry (
     }
 
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, DirRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
+    if (RootCtx != NULL &&
+        !NtfsEfiIndexRootOk ((PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset))) {
+        NtfsEfiFreeAttrCtx (RootCtx);
+        RootCtx = NULL;   /* implausible index header - leave the root alone */
+    }
     if (RootCtx != NULL) {
         PNTFS_ATTR_RECORD RootAttr = (PNTFS_ATTR_RECORD)((PUCHAR)DirRec + RootOffset);
         PUCHAR ValPtr = (PUCHAR)RootAttr + RootAttr->Resident.ValueOffset;
@@ -118,6 +113,7 @@ NtfsPatchParentIndexEntry (
                 Block = (PINDEX_BUFFER)Buf;
                 if (Block->Ntfs.Type != NRH_INDX_TYPE) continue;
                 if (EFI_ERROR (NtfsEfiFixupRecord (Vcb, &Block->Ntfs))) continue;
+                if (!NtfsEfiIndexBlockOk (Vcb, Block)) continue;
                 E  = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
                 L2 = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
                 while ((PUCHAR)E < (PUCHAR)L2) {
@@ -513,6 +509,17 @@ NtfsShrinkNonResidentRuns (
     OldAttrLen  = Attr->Length;
     NewAttrLen  = (ULONG)ROUND_UP (Attr->NonResident.MappingPairsOffset + MPLen, ATTR_RECORD_ALIGNMENT);
     GrowthBytes = (LONG)NewAttrLen - (LONG)OldAttrLen;   /* <= 0 when shrinking */
+
+    /* Truncation normally shortens the mapping pairs, but the re-encoding is
+     * independent of the original stream's byte layout, so don't ASSUME it got
+     * shorter: growing past the record's free space would shift the tail out of
+     * the buffer. (Clusters are already freed at this point; refusing here just
+     * leaves them free with the attribute unchanged - the volume stays valid.) */
+    if (GrowthBytes > 0 &&
+        (UINT64)GrowthBytes > (UINT64)Rec->BytesAllocated - Rec->BytesInUse) {
+        FreePool (Runs); FreePool (MP);
+        return EFI_UNSUPPORTED;
+    }
 
     NextAttr = (PUCHAR)Attr + OldAttrLen;
     TailLen  = Rec->BytesInUse - (ULONG)(NextAttr - (PUCHAR)Rec);

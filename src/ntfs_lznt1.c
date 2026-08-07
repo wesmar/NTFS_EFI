@@ -196,8 +196,21 @@ NtfsEfiLznt1DecompressBuffer (
         }
 
         if (Header.Chunk.IsCompressed) {
-            EFI_STATUS Status = NtfsEfiLznt1DecompressChunk (
-                    UncompressedChunk, EndOfUncompressed,
+            /*
+             * One LZNT1 chunk decompresses to at most 4096 bytes, and
+             * NtfsEfiLznt1DecompressChunk's format-selection loop
+             * (`while (UncompressedBuffer + MaxDisplacement[Format] < OutputPointer)`)
+             * relies on that: the table has 9 entries, the last covering 4096.
+             * Handing it the end of the whole compression unit (64 KiB) as the
+             * output limit let a crafted copy token push OutputPointer past
+             * +4096 within a single chunk, and Format then indexed past the
+             * table. Cap the per-chunk limit at one chunk's worth of output.
+             */
+            PUCHAR ChunkOutEnd = UncompressedChunk + LZNT1_MAX_UNCOMPRESSED_CHUNK_SIZE;
+            EFI_STATUS Status;
+            if (ChunkOutEnd > EndOfUncompressed) ChunkOutEnd = EndOfUncompressed;
+            Status = NtfsEfiLznt1DecompressChunk (
+                    UncompressedChunk, ChunkOutEnd,
                     CompressedChunk + sizeof (Header), CompressedChunk + CompressedChunkSize,
                     &UncompressedChunkSize);
             if (EFI_ERROR (Status)) {
@@ -256,11 +269,21 @@ NtfsEfiReadCompressedAttr (
     IN  ULONG          Length
     )
 {
-    ULONG   CompUnitClusters = 1U << Ctx->pRecord->NonResident.CompressionUnit;
-    UINT64  CompUnitBytes    = (UINT64)CompUnitClusters * Vcb->BytesPerCluster;
+    ULONG   CompUnitClusters;
+    UINT64  CompUnitBytes;
     ULONG   AlreadyRead      = 0;
     PUCHAR  UnitBuf;
     PUCHAR  RawBuf;
+
+    /* CompressionUnit is a USHORT off the disk used as a shift count: >= 32 is
+     * undefined behaviour and anything above ~16 (64 MiB unit with 4 KiB
+     * clusters) is not a shape NTFS produces. Refuse instead of shifting. */
+    if (Ctx->pRecord->NonResident.CompressionUnit == 0 ||
+        Ctx->pRecord->NonResident.CompressionUnit > 16) {
+        return 0;
+    }
+    CompUnitClusters = 1U << Ctx->pRecord->NonResident.CompressionUnit;
+    CompUnitBytes    = (UINT64)CompUnitClusters * Vcb->BytesPerCluster;
 
     UnitBuf = AllocatePool ((UINTN)CompUnitBytes);
     RawBuf  = AllocatePool ((UINTN)CompUnitBytes);

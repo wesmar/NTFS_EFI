@@ -4,6 +4,52 @@
 
 #include "ntfs.h"
 
+/*
+ * How big is the buffer a record header lives in, and are its update-sequence
+ * -array fields inside it?
+ *
+ * UsaOffset and UsaCount come straight off the disk, and the fixup loops below
+ * use BOTH as write bounds: they rewrite the last two bytes of every
+ * BytesPerSector-sized chunk of the record and copy the saved values out of
+ * USA[i]. A record claiming UsaCount == 0xFFFF therefore walks ~32 MB past a
+ * 1 KiB heap allocation, writing as it goes - the one place in this driver
+ * where a corrupt/hand-crafted record turns into heap CORRUPTION rather than a
+ * bad read. (The old code even computed the record size and then threw it away
+ * with (VOID)RecordSize, i.e. the check was meant to be here from the start.)
+ *
+ * The buffer size is not passed in, but it is always implied by the record
+ * type: a FILE record is Vcb->BytesPerFileRecord, an INDX block is
+ * Vcb->BytesPerIndexRecord - every caller allocates exactly that. Anything
+ * else is not a fixed-up NTFS record at all and is refused.
+ */
+static BOOLEAN
+NtfsUsaBounds (
+    IN  PNTFS_EFI_VCB       Vcb,
+    IN  NTFS_RECORD_HEADER *Hdr,
+    OUT ULONG              *RecordSize
+    )
+{
+    ULONG Size;
+
+    if (Hdr->Type == NRH_FILE_TYPE)      Size = Vcb->BytesPerFileRecord;
+    else if (Hdr->Type == NRH_INDX_TYPE) Size = Vcb->BytesPerIndexRecord;
+    else                                 return FALSE;
+
+    *RecordSize = Size;
+
+    /* the USA itself must sit inside the record, after the header */
+    if (Hdr->UsaOffset < sizeof (NTFS_RECORD_HEADER) ||
+        (ULONG)Hdr->UsaOffset + (ULONG)Hdr->UsaCount * sizeof (USHORT) > Size) {
+        return FALSE;
+    }
+    /* one USN slot per sector-sized chunk, plus USA[0] (the marker itself);
+     * the last patched position is Hdr + (UsaCount-1)*BytesPerSector - 2 */
+    if ((ULONG)(Hdr->UsaCount - 1) * Vcb->BytesPerSector > Size) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
 EFI_STATUS
 NtfsEfiFixupRecord (
     IN PNTFS_EFI_VCB       Vcb,
@@ -17,18 +63,97 @@ NtfsEfiFixupRecord (
     ULONG   RecordSize;
 
     if (Hdr->UsaOffset == 0 || Hdr->UsaCount == 0) return EFI_SUCCESS;
+    if (!NtfsUsaBounds (Vcb, Hdr, &RecordSize)) return EFI_VOLUME_CORRUPTED;
 
     USA       = (PUSHORT)((PUCHAR)Hdr + Hdr->UsaOffset);
     USN       = USA[0];
-    RecordSize = (Hdr->UsaCount - 1) * Vcb->BytesPerSector;
 
     for (i = 1; i < Hdr->UsaCount; i++) {
         SectorEnd = (PUSHORT)((PUCHAR)Hdr + i * Vcb->BytesPerSector - sizeof (USHORT));
         if (*SectorEnd != USN) return EFI_VOLUME_CORRUPTED;
         *SectorEnd = USA[i];
     }
-    (VOID)RecordSize;
     return EFI_SUCCESS;
+}
+
+/*
+ * Validate the two offsets every index-entry walk in this driver derives its
+ * start/end pointers from, against the buffer the header actually lives in.
+ *
+ * INDEX_HEADER_ATTRIBUTE.FirstEntryOffset / .TotalSizeOfEntries / .AllocatedSize
+ * are on-disk data. Read paths use them as `First`/`Last` walk bounds, and the
+ * INSERT paths (NtfsInsertIntoIndexEntries, NtfsSpliceInIndexBlock) use
+ * AllocatedSize as the room-check for a shift-forward - so a bogus AllocatedSize
+ * is an out-of-bounds heap WRITE, not just a wild read. NtfsEfiFixupRecord only
+ * verifies the per-sector USN; it says nothing about these three. This is the
+ * index-block equivalent of the AttributeOffset/BytesInUse check in
+ * NtfsEfiReadFileRecord: one central place instead of ~15 call sites.
+ *
+ * Avail is the number of bytes from Header to the end of its buffer.
+ */
+BOOLEAN
+NtfsEfiIndexHeaderOk (
+    IN INDEX_HEADER_ATTRIBUTE *Header,
+    IN UINT64                  Avail
+    )
+{
+    if (Header == NULL) return FALSE;
+    if (Avail < sizeof (INDEX_HEADER_ATTRIBUTE)) return FALSE;
+    if ((UINT64)Header->FirstEntryOffset < sizeof (INDEX_HEADER_ATTRIBUTE)) return FALSE;
+    if ((UINT64)Header->TotalSizeOfEntries > Avail) return FALSE;
+    if ((UINT64)Header->FirstEntryOffset > (UINT64)Header->TotalSizeOfEntries) return FALSE;
+    /*
+     * AllocatedSize is deliberately NOT compared against Avail here. For a
+     * resident $INDEX_ROOT it can legitimately exceed the value's own length
+     * (Windows self-heal lowers TotalSizeOfEntries and leaves slack behind -
+     * see the comment in NtfsInsertIndexEntrySmall), and nothing writes using
+     * the root's AllocatedSize as a bound. Where it IS a write bound - INDX
+     * blocks, via NtfsInsertIntoIndexEntries / NtfsSpliceInIndexBlock -
+     * NtfsEfiIndexBlockOk below checks it.
+     */
+    return TRUE;
+}
+
+/*
+ * Same check for a resident $INDEX_ROOT attribute inside an MFT record. The
+ * attribute walk (NtfsEfiFindAttrInRecord) has already established that the
+ * whole attribute - and hence its value - lies inside the record, so the
+ * value's own declared length is the bound the index header must respect.
+ */
+BOOLEAN
+NtfsEfiIndexRootOk (
+    IN PNTFS_ATTR_RECORD RootAttr
+    )
+{
+    PINDEX_ROOT_ATTRIBUTE Ir;
+    UINT64                HeaderOffset = FIELD_OFFSET (INDEX_ROOT_ATTRIBUTE, Header);
+
+    if (RootAttr->IsNonResident) return FALSE;   /* $INDEX_ROOT is always resident */
+    if ((UINT64)RootAttr->Resident.ValueLength <= HeaderOffset) return FALSE;
+
+    Ir = (PINDEX_ROOT_ATTRIBUTE)((PUCHAR)RootAttr + RootAttr->Resident.ValueOffset);
+    return NtfsEfiIndexHeaderOk (&Ir->Header,
+                                 (UINT64)RootAttr->Resident.ValueLength - HeaderOffset);
+}
+
+/* Same check for an INDX block read into a Vcb->BytesPerIndexRecord buffer. */
+BOOLEAN
+NtfsEfiIndexBlockOk (
+    IN PNTFS_EFI_VCB Vcb,
+    IN PINDEX_BUFFER Block
+    )
+{
+    UINT64 HeaderOffset = (UINT64)((PUCHAR)&Block->Header - (PUCHAR)Block);
+    UINT64 Avail;
+
+    if (Vcb->BytesPerIndexRecord <= HeaderOffset) return FALSE;
+    Avail = (UINT64)Vcb->BytesPerIndexRecord - HeaderOffset;
+
+    if (!NtfsEfiIndexHeaderOk (&Block->Header, Avail)) return FALSE;
+    /* insert/splice into an INDX block uses AllocatedSize as its room check */
+    if ((UINT64)Block->Header.AllocatedSize > Avail) return FALSE;
+    if ((UINT64)Block->Header.TotalSizeOfEntries > (UINT64)Block->Header.AllocatedSize) return FALSE;
+    return TRUE;
 }
 
 /* Store a fixed-up record image into the MFT record cache (round-robin, or
@@ -119,7 +244,7 @@ NtfsEfiReadFileRecord (
  * old USN defeats that - a torn write mixing this generation's sector
  * ends with a stale previous generation's middle would look consistent.
  */
-static VOID
+static BOOLEAN
 NtfsEfiUnfixupRecord (
     IN PNTFS_EFI_VCB       Vcb,
     IN NTFS_RECORD_HEADER *Hdr
@@ -129,8 +254,11 @@ NtfsEfiUnfixupRecord (
     PUSHORT SectorEnd;
     USHORT  USN;
     USHORT  i;
+    ULONG   RecordSize;
 
-    if (Hdr->UsaOffset == 0 || Hdr->UsaCount == 0) return;
+    if (Hdr->UsaOffset == 0 || Hdr->UsaCount == 0) return TRUE;
+    /* same bounds as the fixup direction - this one WRITES the sector ends */
+    if (!NtfsUsaBounds (Vcb, Hdr, &RecordSize)) return FALSE;
 
     USA = (PUSHORT)((PUCHAR)Hdr + Hdr->UsaOffset);
     USN = (USHORT)(USA[0] + 1);
@@ -142,6 +270,7 @@ NtfsEfiUnfixupRecord (
         USA[i]     = *SectorEnd;   /* preserve the (possibly just-edited) real data */
         *SectorEnd = USN;
     }
+    return TRUE;
 }
 
 EFI_STATUS
@@ -156,7 +285,7 @@ NtfsEfiWriteMultiSectorRecord (
     ULONG Written;
 
     gNtfsIndexWrites++;
-    NtfsEfiUnfixupRecord (Vcb, Hdr);
+    if (!NtfsEfiUnfixupRecord (Vcb, Hdr)) return EFI_VOLUME_CORRUPTED;
     Written = NtfsEfiWriteAttr (Vcb, AttrCtx, AttrOffset, (PCHAR)Hdr, RecordLength);
     NtfsEfiFixupRecord (Vcb, Hdr);
 
@@ -211,7 +340,7 @@ NtfsEfiWriteFileRecord (
     ULONG  Written;
 
     gNtfsRecordWrites++;
-    NtfsEfiUnfixupRecord (Vcb, &FileRecord->Ntfs);
+    if (!NtfsEfiUnfixupRecord (Vcb, &FileRecord->Ntfs)) return EFI_VOLUME_CORRUPTED;
     Written = NtfsEfiWriteAttr (Vcb, Vcb->MFTContext, ByteOffset,
                                 (PCHAR)FileRecord, Vcb->BytesPerFileRecord);
     /* keep $MFTMirr in lock-step for the mirrored primaries (0-3) */

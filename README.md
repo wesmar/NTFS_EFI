@@ -437,8 +437,7 @@ NTFS_EFI/
 │   ├── ntfs_symlink.c        # $REPARSE_POINT symlink target resolver
 │   ├── ntfs_time.c           # NTFS 100 ns ticks to and from EFI_TIME
 │   ├── ntfs_globals.c        # GUIDs, PCD/HII stubs, debug print, performance counters
-│   ├── DebugLog.c            # Optional ESP log, compiled out unless ENABLE_DEBUG_LOG is set
-│   └── ntfs_efi_protocol.c   # Earlier single-file version, kept for reference — NOT in the build
+│   └── DebugLog.c            # Optional ESP log, compiled out unless ENABLE_DEBUG_LOG is set
 │
 ├── ec/                       # EC.efi — EFI Commander
 │   ├── Main.c                # Entry point, event loop, key dispatch, quick-find
@@ -463,7 +462,7 @@ NTFS_EFI/
 └── build.ps1                 # Finds MSBuild via vswhere, builds all three, packs the release
 ```
 
-Weight sits where the hard problems are: `ntfs_create.c` and `ntfs_delete.c` together are the B+tree engine, `ntfs_file.c` carries the whole protocol surface plus non-resident growth, and `ntfs_bitmap.c` holds the allocator that decides how fast a copy runs. `src/ntfs_efi_protocol.c` predates the split into modules; it stays in the tree as a reference but is not listed in `ntfs.vcxproj`, so it never reaches the linker.
+Weight sits where the hard problems are: `ntfs_create.c` and `ntfs_delete.c` together are the B+tree engine, `ntfs_file.c` carries the whole protocol surface plus non-resident growth, and `ntfs_bitmap.c` holds the allocator that decides how fast a copy runs.
 
 ---
 

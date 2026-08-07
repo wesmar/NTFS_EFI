@@ -91,7 +91,8 @@ NtfsEfiBrowseSubNode (
     IN     BOOLEAN             DirSearch,
     IN     BOOLEAN             CaseSensitive,
     IN OUT ULONG              *StartEntry,
-    IN OUT ULONG              *CurrentEntry
+    IN OUT ULONG              *CurrentEntry,
+    IN     ULONG               Depth
     );
 
 /*
@@ -108,8 +109,23 @@ NtfsEfiSearchSubNode (
     IN ULONGLONG          VCN,
     IN CONST WCHAR       *Name,
     IN UINTN              NameLen,
-    IN BOOLEAN            CaseSensitive
+    IN BOOLEAN            CaseSensitive,
+    IN ULONG              Depth
     );
+
+/*
+ * Depth cap for every recursive INDX descent below.
+ *
+ * A B+tree node's child pointers are on-disk VCNs with nothing stopping a
+ * corrupt (or deliberately crafted) index from pointing a node at itself or at
+ * an ancestor. Each recursion level allocates a BytesPerIndexRecord pool buffer
+ * and a stack frame, so an index cycle otherwise recurses until the DXE stack
+ * or the pool is exhausted - a hang/crash reachable by merely LISTING a
+ * directory. The write-side walkers in ntfs_delete.c already cap at 32; this
+ * gives the read side the same guard. A real NTFS directory index is a handful
+ * of levels deep even with millions of entries.
+ */
+#define NTFS_MAX_INDEX_DEPTH 32
 
 /* Case-aware ordering compare of two (possibly different-length) names,
  * matching NTFS's "shorter-is-less-when-prefix-equal" collation rule. */
@@ -148,7 +164,8 @@ NtfsEfiSearchIndexBlock (
     IN PNTFS_ATTR_CTX         IndexAllocCtx,
     IN PUCHAR                 Bitmap,
     IN ULONG                  BitmapBits,
-    IN ULONG                  ClustPerBlock
+    IN ULONG                  ClustPerBlock,
+    IN ULONG                  Depth
     )
 {
     PINDEX_ENTRY_ATTRIBUTE Entry = First;
@@ -161,15 +178,17 @@ NtfsEfiSearchIndexBlock (
          * loop forever), and check END/NODE before anything else.
          */
         if (Entry->Length == 0) break;
+        if ((PUCHAR)Entry + Entry->Length > (PUCHAR)Last) break;
 
         if (Entry->Flags & NTFS_INDEX_ENTRY_END) {
             Print (L"[ntfs] Search: hit END, NODE=%d IndexAllocCtx=%p\n",
                 (Entry->Flags & NTFS_INDEX_ENTRY_NODE) != 0, IndexAllocCtx);
-            if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) && IndexAllocCtx != NULL) {
+            if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) && IndexAllocCtx != NULL &&
+                Entry->Length >= sizeof (ULONGLONG)) {
                 ULONGLONG SubVCN = *(PULONGLONG)
                     ((PUCHAR)Entry + Entry->Length - sizeof (ULONGLONG));
                 return NtfsEfiSearchSubNode (Vcb, IndexAllocCtx, Bitmap, BitmapBits,
-                            ClustPerBlock, SubVCN, Name, NameLen, CaseSensitive);
+                            ClustPerBlock, SubVCN, Name, NameLen, CaseSensitive, Depth);
             }
             return (ULONGLONG)-1LL;
         }
@@ -186,7 +205,13 @@ NtfsEfiSearchIndexBlock (
              */
             BOOLEAN IsRealEntry =
                 (Entry->Data.Directory.IndexedFile & NTFS_MFT_MASK) >= NTFS_FILE_FIRST_USER_FILE;
-            INTN Cmp = NtfsEfiCompareNames (Name, NameLen,
+            INTN Cmp;
+            /* the key is compared below: it must lie inside this entry */
+            if ((UINT64)FIELD_OFFSET (INDEX_ENTRY_ATTRIBUTE, FileName.Name) +
+                    (UINT64)Entry->FileName.NameLength * sizeof (WCHAR) > (UINT64)Entry->Length) {
+                break;
+            }
+            Cmp = NtfsEfiCompareNames (Name, NameLen,
                             Entry->FileName.Name, Entry->FileName.NameLength,
                             CaseSensitive, Vcb->UpcaseTable);
             /* {
@@ -205,11 +230,12 @@ NtfsEfiSearchIndexBlock (
             if (Cmp < 0) {
                 /* Target sorts before this entry: it can only be in the
                  * subtree of keys smaller than this entry, if any. */
-                if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) && IndexAllocCtx != NULL) {
+                if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) && IndexAllocCtx != NULL &&
+                    Entry->Length >= sizeof (ULONGLONG)) {
                     ULONGLONG SubVCN = *(PULONGLONG)
                         ((PUCHAR)Entry + Entry->Length - sizeof (ULONGLONG));
                     return NtfsEfiSearchSubNode (Vcb, IndexAllocCtx, Bitmap, BitmapBits,
-                                ClustPerBlock, SubVCN, Name, NameLen, CaseSensitive);
+                                ClustPerBlock, SubVCN, Name, NameLen, CaseSensitive, Depth);
                 }
                 return (ULONGLONG)-1LL;
             }
@@ -232,7 +258,8 @@ NtfsEfiSearchSubNode (
     IN ULONGLONG          VCN,
     IN CONST WCHAR       *Name,
     IN UINTN              NameLen,
-    IN BOOLEAN            CaseSensitive
+    IN BOOLEAN            CaseSensitive,
+    IN ULONG              Depth
     )
 {
     ULONG                  NodeNumber = (ULONG)(VCN / ClustPerBlock);
@@ -240,6 +267,8 @@ NtfsEfiSearchSubNode (
     PINDEX_BUFFER          Block;
     PINDEX_ENTRY_ATTRIBUTE First, Last;
     ULONGLONG              Result;
+
+    if (Depth >= NTFS_MAX_INDEX_DEPTH) return (ULONGLONG)-1LL;
 
     Print (L"[ntfs] SearchSubNode: VCN=%ld ClustPerBlock=%d NodeNumber=%d Bitmap=%p BitmapBits=%d\n",
         VCN, ClustPerBlock, NodeNumber, Bitmap, BitmapBits);
@@ -269,13 +298,17 @@ NtfsEfiSearchSubNode (
         Print (L"[ntfs] SearchSubNode: bad signature %08x\n", Block->Ntfs.Type);
         FreePool (IndexBuf); return (ULONGLONG)-1LL;
     }
-    NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs);
+    if (EFI_ERROR (NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block)) {
+        Print (L"[ntfs] SearchSubNode: bad fixup/index header\n");
+        FreePool (IndexBuf); return (ULONGLONG)-1LL;
+    }
 
     First = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
     Last  = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
 
     Result = NtfsEfiSearchIndexBlock (First, Last, Name, NameLen, CaseSensitive,
-                Vcb, IndexAllocCtx, Bitmap, BitmapBits, ClustPerBlock);
+                Vcb, IndexAllocCtx, Bitmap, BitmapBits, ClustPerBlock, Depth + 1);
 
     FreePool (IndexBuf);
     return Result;
@@ -319,13 +352,33 @@ NtfsEfiFindInDirectory (
         NtfsEfiFreeAttrCtx (IndexRootCtx); FreePool (DirRecord);
         return (ULONGLONG)-1LL;
     }
-    NtfsEfiReadAttr (Vcb, IndexRootCtx, 0, (PCHAR)IndexBuf, Vcb->BytesPerIndexRecord);
-    NtfsEfiFreeAttrCtx (IndexRootCtx);
+    {
+        ULONG RootBytes = NtfsEfiReadAttr (Vcb, IndexRootCtx, 0, (PCHAR)IndexBuf,
+                                          Vcb->BytesPerIndexRecord);
+        NtfsEfiFreeAttrCtx (IndexRootCtx);
 
-    IndexRoot = (PINDEX_ROOT_ATTRIBUTE)IndexBuf;
+        IndexRoot = (PINDEX_ROOT_ATTRIBUTE)IndexBuf;
+        /* validate against what was actually read, not the buffer size */
+        if (RootBytes <= (ULONG)FIELD_OFFSET (INDEX_ROOT_ATTRIBUTE, Header) ||
+            !NtfsEfiIndexHeaderOk (&IndexRoot->Header,
+                (UINT64)RootBytes - FIELD_OFFSET (INDEX_ROOT_ATTRIBUTE, Header))) {
+            FreePool (IndexBuf); FreePool (DirRecord);
+            return (ULONGLONG)-1LL;
+        }
+    }
+    /*
+     * BOTH offsets are relative to the INDEX_HEADER, not to the start of the
+     * $INDEX_ROOT value. Last used to be computed from IndexBuf, i.e. 16 bytes
+     * (the AttributeType/CollationRule/SizeOfEntry/ClustersPerIndexRecord
+     * prefix) short of where the entries really end - every other index walk in
+     * the driver uses &Header. With a 16-byte END entry the walk then stopped
+     * one entry early: for a small-but-large-index directory that meant never
+     * descending through the END entry's sub-node pointer, so a name that sorts
+     * after everything in the root read back as EFI_NOT_FOUND.
+     */
     First     = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header
                     + IndexRoot->Header.FirstEntryOffset);
-    Last      = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)IndexBuf
+    Last      = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IndexRoot->Header
                     + IndexRoot->Header.TotalSizeOfEntries);
 
     Print (L"[ntfs] FindInDirectory: DirMFT=%ld IndexBuf=%p HeaderAt=%p FirstEntryOffset=%d TotalSizeOfEntries=%d AllocatedSize=%d First=%p Last=%p\n",
@@ -367,7 +420,8 @@ NtfsEfiFindInDirectory (
             PINDEX_ENTRY_ATTRIBUTE Entry = First;
             while ((PUCHAR)Entry < (PUCHAR)Last) {
                 if (Entry->Length == 0) break;
-                if (Entry->Flags & NTFS_INDEX_ENTRY_NODE)
+                if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) &&
+                    Entry->Length >= sizeof (ULONGLONG))
                 {
                     ULONGLONG SubVCN = *(PULONGLONG)
                         ((PUCHAR)Entry + Entry->Length - sizeof (ULONGLONG));
@@ -377,7 +431,7 @@ NtfsEfiFindInDirectory (
                                 BitmapBuf, BitmapBits, ClustPerBlock,
                                 SubVCN, Name, NameLen,
                                 DirSearch, CaseSensitive,
-                                StartEntry, &CurrentEntry);
+                                StartEntry, &CurrentEntry, 0);
                     if (Result != (ULONGLONG)-1LL) break;
                 }
                 if (Entry->Flags & NTFS_INDEX_ENTRY_END) break;
@@ -389,7 +443,7 @@ NtfsEfiFindInDirectory (
         ULONG BitmapBits = (BitmapBuf && IndexAllocCtx) ?
             (ULONG)(NtfsEfiAttrDataLength (IndexAllocCtx) / (ClustPerBlock * Vcb->BytesPerCluster)) : 0;
         Result = NtfsEfiSearchIndexBlock (First, Last, Name, NameLen, CaseSensitive,
-                    Vcb, IndexAllocCtx, BitmapBuf, BitmapBits, ClustPerBlock);
+                    Vcb, IndexAllocCtx, BitmapBuf, BitmapBits, ClustPerBlock, 0);
     }
 
     if (BitmapBuf)     FreePool (BitmapBuf);
@@ -403,7 +457,7 @@ NtfsEfiFindInDirectory (
 
 static VOID NtfsCollectSub (PNTFS_EFI_VCB Vcb, PNTFS_ATTR_CTX Alloc,
                             ULONG ClustPerBlock, ULONGLONG VCN,
-                            ULONGLONG *Out, ULONG Max, ULONG *Count);
+                            ULONGLONG *Out, ULONG Max, ULONG *Count, ULONG Depth);
 
 static VOID
 NtfsCollectBlock (
@@ -414,15 +468,17 @@ NtfsCollectBlock (
     IN PINDEX_ENTRY_ATTRIBUTE Last,
     OUT ULONGLONG            *Out,
     IN ULONG                  Max,
-    IN OUT ULONG             *Count
+    IN OUT ULONG             *Count,
+    IN ULONG                  Depth
     )
 {
     PINDEX_ENTRY_ATTRIBUTE E = First;
     while ((PUCHAR)E < (PUCHAR)Last && *Count < Max) {
         if (E->Length == 0) break;
-        if ((E->Flags & NTFS_INDEX_ENTRY_NODE) && Alloc != NULL) {
+        if ((E->Flags & NTFS_INDEX_ENTRY_NODE) && Alloc != NULL &&
+            E->Length >= sizeof (ULONGLONG)) {
             ULONGLONG Sub = *(PULONGLONG)((PUCHAR)E + E->Length - sizeof (ULONGLONG));
-            NtfsCollectSub (Vcb, Alloc, ClustPerBlock, Sub, Out, Max, Count);  /* in-order: subtree first */
+            NtfsCollectSub (Vcb, Alloc, ClustPerBlock, Sub, Out, Max, Count, Depth);  /* in-order: subtree first */
         }
         if (E->Flags & NTFS_INDEX_ENTRY_END) break;
         if ((E->Data.Directory.IndexedFile & NTFS_MFT_MASK) >= NTFS_FILE_FIRST_USER_FILE
@@ -436,12 +492,14 @@ NtfsCollectBlock (
 
 static VOID
 NtfsCollectSub (PNTFS_EFI_VCB Vcb, PNTFS_ATTR_CTX Alloc, ULONG ClustPerBlock,
-                ULONGLONG VCN, ULONGLONG *Out, ULONG Max, ULONG *Count)
+                ULONGLONG VCN, ULONGLONG *Out, ULONG Max, ULONG *Count, ULONG Depth)
 {
-    PUCHAR IndexBuf = AllocatePool (Vcb->BytesPerIndexRecord);
+    PUCHAR IndexBuf;
     PINDEX_BUFFER Block;
     ULONG Read;
     EFI_STATUS FixupStatus = EFI_NOT_READY;
+    if (Depth >= NTFS_MAX_INDEX_DEPTH) return;
+    IndexBuf = AllocatePool (Vcb->BytesPerIndexRecord);
     if (IndexBuf == NULL) return;
     Read = NtfsEfiReadAttr (Vcb, Alloc, VCN * Vcb->BytesPerCluster,
             (PCHAR)IndexBuf, Vcb->BytesPerIndexRecord);
@@ -450,10 +508,11 @@ NtfsCollectSub (PNTFS_EFI_VCB Vcb, PNTFS_ATTR_CTX Alloc, ULONG ClustPerBlock,
         if (Block->Ntfs.Type == NRH_INDX_TYPE) {
             FixupStatus = NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs);
         }
-        if (Block->Ntfs.Type == NRH_INDX_TYPE && !EFI_ERROR (FixupStatus)) {
+        if (Block->Ntfs.Type == NRH_INDX_TYPE && !EFI_ERROR (FixupStatus) &&
+            NtfsEfiIndexBlockOk (Vcb, Block)) {
             PINDEX_ENTRY_ATTRIBUTE F = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
             PINDEX_ENTRY_ATTRIBUTE L = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
-            NtfsCollectBlock (Vcb, Alloc, ClustPerBlock, F, L, Out, Max, Count);
+            NtfsCollectBlock (Vcb, Alloc, ClustPerBlock, F, L, Out, Max, Count, Depth + 1);
         }
     }
     FreePool (IndexBuf);
@@ -478,15 +537,24 @@ NtfsEfiCollectDir (
     if (RootCtx == NULL) { FreePool (Rec); return 0; }
     IndexBuf = AllocatePool (Vcb->BytesPerIndexRecord);
     if (IndexBuf == NULL) { NtfsEfiFreeAttrCtx (RootCtx); FreePool (Rec); return 0; }
-    NtfsEfiReadAttr (Vcb, RootCtx, 0, (PCHAR)IndexBuf, Vcb->BytesPerIndexRecord);
-    NtfsEfiFreeAttrCtx (RootCtx);
-    IR = (PINDEX_ROOT_ATTRIBUTE)IndexBuf;
+    {
+        ULONG RootBytes = NtfsEfiReadAttr (Vcb, RootCtx, 0, (PCHAR)IndexBuf,
+                                          Vcb->BytesPerIndexRecord);
+        NtfsEfiFreeAttrCtx (RootCtx);
+        IR = (PINDEX_ROOT_ATTRIBUTE)IndexBuf;
+        if (RootBytes <= (ULONG)FIELD_OFFSET (INDEX_ROOT_ATTRIBUTE, Header) ||
+            !NtfsEfiIndexHeaderOk (&IR->Header,
+                (UINT64)RootBytes - FIELD_OFFSET (INDEX_ROOT_ATTRIBUTE, Header))) {
+            FreePool (IndexBuf); FreePool (Rec);
+            return 0;
+        }
+    }
     AllocCtx = NtfsEfiFindAttribute (Vcb, Rec, AttributeIndexAllocation, L"$I30", 4, NULL);
     ClustPerBlock = Vcb->BytesPerIndexRecord / Vcb->BytesPerCluster;
     {
         PINDEX_ENTRY_ATTRIBUTE F = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IR->Header + IR->Header.FirstEntryOffset);
         PINDEX_ENTRY_ATTRIBUTE L = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&IR->Header + IR->Header.TotalSizeOfEntries);
-        NtfsCollectBlock (Vcb, AllocCtx, ClustPerBlock, F, L, Out, Max, &Count);
+        NtfsCollectBlock (Vcb, AllocCtx, ClustPerBlock, F, L, Out, Max, &Count, 0);
     }
     if (AllocCtx) NtfsEfiFreeAttrCtx (AllocCtx);
     FreePool (IndexBuf);
@@ -514,7 +582,14 @@ NtfsEfiScanIndexBlock (
 
     while ((PUCHAR)Entry < (PUCHAR)Last) {
         if (Entry->Length < sizeof (INDEX_ENTRY_ATTRIBUTE)) break;
+        if ((PUCHAR)Entry + Entry->Length > (PUCHAR)Last) break;
         if (Entry->Flags & NTFS_INDEX_ENTRY_END) break;
+        /* the name is read below (compare + debug print): it must be inside
+         * this entry, NameLength being its own on-disk byte */
+        if ((UINT64)FIELD_OFFSET (INDEX_ENTRY_ATTRIBUTE, FileName.Name) +
+                (UINT64)Entry->FileName.NameLength * sizeof (WCHAR) > (UINT64)Entry->Length) {
+            break;
+        }
 
         {
             UINTN  EntryLen = Entry->FileName.NameLength;
@@ -563,7 +638,8 @@ NtfsEfiBrowseSubNode (
     IN     BOOLEAN             DirSearch,
     IN     BOOLEAN             CaseSensitive,
     IN OUT ULONG              *StartEntry,
-    IN OUT ULONG              *CurrentEntry
+    IN OUT ULONG              *CurrentEntry,
+    IN     ULONG               Depth
     )
 {
     ULONG               NodeNumber = (ULONG)(VCN / ClustPerBlock);
@@ -571,6 +647,8 @@ NtfsEfiBrowseSubNode (
     PINDEX_BUFFER       Block;
     PINDEX_ENTRY_ATTRIBUTE First, Last, Entry;
     ULONGLONG           Result;
+
+    if (Depth >= NTFS_MAX_INDEX_DEPTH) return (ULONGLONG)-1LL;
 
     /* validate against bitmap */
     if (Bitmap != NULL && BitmapBits > 0 && NodeNumber < BitmapBits) {
@@ -592,7 +670,10 @@ NtfsEfiBrowseSubNode (
     if (Block->Ntfs.Type != NRH_INDX_TYPE) {
         FreePool (IndexBuf); return (ULONGLONG)-1LL;
     }
-    NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs);
+    if (EFI_ERROR (NtfsEfiFixupRecord (Vcb, &((PFILE_RECORD_HEADER)Block)->Ntfs)) ||
+        !NtfsEfiIndexBlockOk (Vcb, Block)) {
+        FreePool (IndexBuf); return (ULONGLONG)-1LL;
+    }
 
     First = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.FirstEntryOffset);
     Last  = (PINDEX_ENTRY_ATTRIBUTE)((PUCHAR)&Block->Header + Block->Header.TotalSizeOfEntries);
@@ -613,7 +694,8 @@ NtfsEfiBrowseSubNode (
              * exclude END entries from the subnode walk or the last -
              * and on a small/fresh directory, only - branch is skipped.
              */
-            if (Entry->Flags & NTFS_INDEX_ENTRY_NODE)
+            if ((Entry->Flags & NTFS_INDEX_ENTRY_NODE) &&
+                Entry->Length >= sizeof (ULONGLONG))
             {
                 ULONGLONG SubVCN = *(PULONGLONG)
                     ((PUCHAR)Entry + Entry->Length - sizeof (ULONGLONG));
@@ -621,7 +703,7 @@ NtfsEfiBrowseSubNode (
                             Bitmap, BitmapBits, ClustPerBlock,
                             SubVCN, Name, NameLen,
                             DirSearch, CaseSensitive,
-                            StartEntry, CurrentEntry);
+                            StartEntry, CurrentEntry, Depth + 1);
                 if (Result != (ULONGLONG)-1LL) break;
             }
             if (Entry->Flags & NTFS_INDEX_ENTRY_END) break;
