@@ -619,6 +619,149 @@ NtfsSubtreeIsEmpty (
     return Empty;
 }
 
+/*
+ * Give back the clusters an emptied directory index no longer needs.
+ *
+ * Collapsing a directory back to a resident $INDEX_ROOT clears every
+ * $BITMAP:$I30 bit but leaves $INDEX_ALLOCATION owning all its clusters. That
+ * is deliberate up to a point - one mapped block is what lets the next create
+ * refill the directory without allocating anything - but a directory that once
+ * held a few thousand entries keeps a megabyte of INDX blocks and a mapping
+ * pair for every run of them, in a 1 KB MFT record that also has to hold the
+ * index root. Emptying such a directory therefore used to make the next fill
+ * harder, not easier.
+ *
+ * The attribute is cut back to KeepBlocks blocks: the tail clusters go back to
+ * $Bitmap, the mapping pairs are re-encoded for what is left, and the record
+ * shrinks by the difference. The kept prefix keeps its own placement, so VCN 0
+ * still maps where it did.
+ */
+static VOID
+NtfsTrimIndexAllocation (
+    IN     PNTFS_EFI_VCB       Vcb,
+    IN OUT PFILE_RECORD_HEADER AllocRec,
+    IN     ULONGLONG           AllocMFT,
+    IN     UINT64              KeepBlocks
+    )
+{
+    ULONG             AllocOffset = 0;
+    PNTFS_ATTR_CTX    Ctx;
+    PNTFS_ATTR_RECORD Attr;
+    NTFS_RUN_ENTRY   *Runs;
+    PUCHAR            MP;
+    ULONG             RunCount = 0, i;
+    UINT64            ClustersPerBlock = Vcb->BytesPerIndexRecord / Vcb->BytesPerCluster;
+    UINT64            KeepClusters, Seen = 0;
+    UINTN             MPLen = 0;
+    INT64             PrevLBN = 0;
+    ULONG             OldAttrLen, NewAttrLen;
+    LONG              Shrink;
+
+    if (ClustersPerBlock == 0) ClustersPerBlock = 1;
+    KeepClusters = KeepBlocks * ClustersPerBlock;
+
+    Ctx = NtfsEfiFindAttrInRecord (Vcb, AllocRec, AttributeIndexAllocation, L"$I30", 4, &AllocOffset);
+    if (Ctx == NULL) return;
+    NtfsEfiFreeAttrCtx (Ctx);
+    if (AllocOffset == 0) return;
+
+    Attr = (PNTFS_ATTR_RECORD)((PUCHAR)AllocRec + AllocOffset);
+    if (!Attr->IsNonResident) return;
+    if ((UINT64)Attr->NonResident.HighestVCN + 1 <= KeepClusters) return;   /* nothing to give back */
+
+    Runs = AllocatePool (NTFS_MAX_RUNS * sizeof (NTFS_RUN_ENTRY));
+    MP   = AllocatePool (NTFS_MAX_RUNS * 9 + 8);
+    if (Runs == NULL || MP == NULL) {
+        if (Runs) FreePool (Runs);
+        if (MP)   FreePool (MP);
+        return;
+    }
+    if (EFI_ERROR (NtfsBuildRunList (Attr, Runs, NTFS_MAX_RUNS, &RunCount)) || RunCount == 0) {
+        FreePool (Runs);
+        FreePool (MP);
+        return;
+    }
+
+    /* walk the runs, keeping the first KeepClusters and freeing the rest */
+    for (i = 0; i < RunCount; i++) {
+        UINT64 Len = Runs[i].Len;
+
+        if (Runs[i].LBN == -1LL) { Seen += Len; continue; }   /* sparse: nothing to free */
+
+        if (Seen >= KeepClusters) {
+            NtfsEfiFreeClusters (Vcb, (UINT64)Runs[i].LBN, Len);
+            Runs[i].Len = 0;
+        } else if (Seen + Len > KeepClusters) {
+            UINT64 Head = KeepClusters - Seen;
+            NtfsEfiFreeClusters (Vcb, (UINT64)Runs[i].LBN + Head, Len - Head);
+            Runs[i].Len = Head;
+        }
+        Seen += Len;
+    }
+
+    /* re-encode what is left */
+    for (i = 0; i < RunCount; i++) {
+        if (Runs[i].Len == 0 || Runs[i].LBN == -1LL) continue;
+        MPLen += NtfsEncodeRunEntry (MP + MPLen, Runs[i].Len, Runs[i].LBN - PrevLBN);
+        PrevLBN = Runs[i].LBN;
+    }
+    MP[MPLen++] = 0;   /* terminator */
+
+    OldAttrLen = Attr->Length;
+    NewAttrLen = (ULONG)ROUND_UP (Attr->NonResident.MappingPairsOffset + MPLen, ATTR_RECORD_ALIGNMENT);
+    Shrink     = (LONG)OldAttrLen - (LONG)NewAttrLen;
+
+    CopyMem ((PUCHAR)Attr + Attr->NonResident.MappingPairsOffset, MP, MPLen);
+    Attr->NonResident.HighestVCN      = (LONGLONG)KeepClusters - 1;
+    Attr->NonResident.AllocatedSize   = (LONGLONG)(KeepClusters * Vcb->BytesPerCluster);
+    Attr->NonResident.DataSize        = Attr->NonResident.AllocatedSize;
+    Attr->NonResident.InitializedSize = Attr->NonResident.AllocatedSize;
+
+    if (Shrink > 0) {
+        PUCHAR TailSrc = (PUCHAR)Attr + OldAttrLen;
+        UINTN  TailLen = AllocRec->BytesInUse - (ULONG)(TailSrc - (PUCHAR)AllocRec);
+
+        CopyMem ((PUCHAR)Attr + NewAttrLen, TailSrc, TailLen);
+        Attr->Length          = NewAttrLen;
+        AllocRec->BytesInUse -= (ULONG)Shrink;
+    }
+
+    FreePool (Runs);
+    FreePool (MP);
+
+    /*
+     * $BITMAP:$I30 was sized for the blocks that just went away, and it sits
+     * in the same 1 KB record as everything else the directory owns. Cut it
+     * back to the eight bytes NTFS keeps as the minimum - one bit per kept
+     * block fits many times over - and clear them, since no block is in use.
+     * The attribute follows $INDEX_ALLOCATION in the record, so its offset is
+     * looked up again after the trim above moved it.
+     */
+    {
+        ULONG          BmOffset = 0;
+        PNTFS_ATTR_CTX BmCtx    = NtfsEfiFindAttrInRecord (Vcb, AllocRec, AttributeBitmap,
+                                      L"$I30", 4, &BmOffset);
+        if (BmCtx != NULL) {
+            NtfsEfiFreeAttrCtx (BmCtx);
+            if (BmOffset != 0) {
+                PNTFS_ATTR_RECORD BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)AllocRec + BmOffset);
+                ULONG             Want   = (ULONG)ROUND_UP ((KeepBlocks + 7) / 8, 8);
+
+                if (Want < 8) Want = 8;
+                if (!BmAttr->IsNonResident && BmAttr->Resident.ValueLength > Want) {
+                    ULONG Have = BmAttr->Resident.ValueLength;
+
+                    NtfsShrinkResidentInRecord (AllocRec, BmOffset, Want, Have - Want);
+                    BmAttr = (PNTFS_ATTR_RECORD)((PUCHAR)AllocRec + BmOffset);
+                    ZeroMem ((PUCHAR)BmAttr + BmAttr->Resident.ValueOffset, Want);
+                }
+            }
+        }
+    }
+
+    NtfsEfiWriteFileRecord (Vcb, AllocMFT, AllocRec);
+}
+
 /* If the index has no real entries but is still marked as having children,
  * collapse it back to a clean resident-only leaf node. This frees all remaining
  * empty INDX blocks, updates the INDEX_ROOT END entry to 16 bytes (no child VCN),
@@ -643,7 +786,8 @@ NtfsCollapseIndexToResident (
     PINDEX_ROOT_ATTRIBUTE  IndexRoot;
     PINDEX_ENTRY_ATTRIBUTE FirstEntry;
     PNTFS_ATTR_CTX         AllocCtx;
-    BOOLEAN                Modified = FALSE;
+    BOOLEAN                Modified  = FALSE;
+    BOOLEAN                TrimAlloc = FALSE;
 
     RootCtx = NtfsEfiFindAttrInRecord (Vcb, RootRec, AttributeIndexRoot, L"$I30", 4, &RootOffset);
     if (RootCtx == NULL) return;
@@ -708,12 +852,19 @@ NtfsCollapseIndexToResident (
         IndexRoot->Header.TotalSizeOfEntries = IndexRoot->Header.FirstEntryOffset + 16;
         IndexRoot->Header.AllocatedSize = IndexRoot->Header.TotalSizeOfEntries;
         Modified = TRUE;
+
+        /* 5. Hand the unused INDX clusters back, keeping one mapped block so
+         * the next create refills the directory without allocating. */
+        TrimAlloc = TRUE;
     }
 
     NtfsEfiFreeAttrCtx (RootCtx);
 
     if (Modified) {
         NtfsEfiWriteFileRecord (Vcb, RootMFT, RootRec);
+    }
+    if (TrimAlloc) {
+        NtfsTrimIndexAllocation (Vcb, AllocRec, AllocMFT, 1);
     }
 }
 
