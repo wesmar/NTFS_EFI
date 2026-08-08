@@ -75,6 +75,21 @@ VOID GuiDrawSearchProgress(
   IN UINTN DirsVisited
 );
 
+// Draws the "walking a tree" overlay: what is being done, where the walk has
+// reached, and how much of it is behind. Unlike the search overlay this one is
+// redrawn as the walk runs, because hashing a tree takes minutes and a box that
+// never changes is indistinguishable from a hang.
+VOID GuiDrawTreeProgress(
+  IN CONST CHAR16* Title,
+  IN CONST CHAR16* CurrentPath,
+  IN UINTN Files,
+  IN UINTN Directories
+);
+
+// A byte count as the panels print it (B, KB, MB, GB). Shared so that a size
+// quoted in a dialog reads the same as the one in the listing behind it.
+VOID FormatFileSize(UINT64 Size, CHAR16* Buffer, UINTN BufferSize);
+
 // Returns the page size (number of visible files) for a given panel height
 UINTN GuiGetPageSize(UINTN PanelHeight);
 

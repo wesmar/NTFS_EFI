@@ -69,6 +69,14 @@ EFI_STATUS FsCopyRecursive(
   IN  FS_COPY_PROGRESS ProgressCallback
 );
 
+// Opens a file for reading from an EC path such as fs1:\dir\file. The caller
+// closes the handle. Anything that streams a file rather than loading it whole
+// starts here instead of repeating the volume lookup.
+EFI_STATUS FsOpenFileForRead(
+  IN  CONST CHAR16* Path,
+  OUT EFI_FILE_PROTOCOL** File
+);
+
 // Reads a file into a newly allocated pool buffer. Buffer must be freed with FreePool.
 EFI_STATUS FsReadFileToBuffer(
   IN  CONST CHAR16* Path,
@@ -155,6 +163,17 @@ EFI_STATUS FsSetFileMeta(
 // The volume a path belongs to, or NULL when the path names none. Several
 // places had their own copy of this loop.
 FS_VOLUME* FsFindVolumeForPath(IN CONST CHAR16* Path);
+
+/*
+ * How many bytes a file holds, or everything under a directory holds. Only
+ * directory listings are read, never file contents, so sizing up a copy costs
+ * a small fraction of the copy itself.
+ *
+ * Returns EFI_NOT_FOUND for a path that does not exist and EFI_BAD_BUFFER_SIZE
+ * if the tree is deeper than the walk is willing to go, in which case *Bytes
+ * holds what was counted before the walk gave up.
+ */
+EFI_STATUS FsGetTreeSize(IN CONST CHAR16* Path, OUT UINT64* Bytes);
 
 // Renames or moves a file or directory within the same volume
 EFI_STATUS FsRenameOrMove(IN CONST CHAR16* SrcPath, IN CONST CHAR16* DstPath);

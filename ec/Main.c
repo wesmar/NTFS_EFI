@@ -529,6 +529,76 @@ static VOID ShowCurrentFileChecksum(IN PANEL* ActivePanel)
   GuiDrawMsgBox(L"File checksum", Message);
 }
 
+// What the tree walk currently under way calls itself in its progress box.
+static CONST CHAR16* gTreeWalkTitle = L"Working";
+
+/*
+ * Progress and cancellation for the recursive compare and update. Two costs
+ * are being kept down here: the box is redrawn every sixteenth entry, because
+ * a full-width redraw per file would dominate a walk over small files, and the
+ * keyboard is polled on every entry, because Esc has to feel immediate.
+ */
+static BOOLEAN TreeWalkProgress(
+  IN CONST CHAR16* CurrentPath,
+  IN UINTN FilesSeen,
+  IN UINTN DirectoriesSeen
+) {
+  EFI_INPUT_KEY key;
+
+  if (((FilesSeen + DirectoriesSeen) & 0x0f) == 1) {
+    GuiDrawTreeProgress(gTreeWalkTitle, CurrentPath, FilesSeen, DirectoriesSeen);
+  }
+  if (gST != NULL && gST->ConIn != NULL &&
+      !EFI_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &key)) &&
+      (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27)) {
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/*
+ * Whether a copy has somewhere to land. The firmware's free-space figure and
+ * the sum of the source sizes are both approximations - cluster slack is not
+ * counted, and an overwrite gives back what the old file held - so a shortfall
+ * asks rather than refuses. Refusing on an estimate would block copies that
+ * would in fact have fitted.
+ *
+ * Returns TRUE when the copy should go ahead.
+ */
+static BOOLEAN CopyHasRoom(
+  IN CONST CHAR16* SourcePath,
+  IN CONST CHAR16* TargetPath,
+  IN CONST CHAR16* TargetDirectory
+) {
+  FS_VOLUME* volume = FsFindVolumeForPath(TargetDirectory);
+  UINT64 needed = 0;
+  UINT64 reclaimed = 0;
+  UINT64 total = 0;
+  UINT64 free = 0;
+  CHAR16 label[32] = { 0 };
+  CHAR16 neededText[32];
+  CHAR16 freeText[32];
+  CHAR16 message[320];
+
+  if (volume == NULL) return TRUE;
+  if (EFI_ERROR(FsGetTreeSize(SourcePath, &needed))) return TRUE;
+  if (EFI_ERROR(FsGetVolumeInfo(volume, &total, &free, label, ARRAY_SIZE(label)))) return TRUE;
+
+  // An existing target is about to be replaced, so its bytes come back.
+  if (TargetPath != NULL && !EFI_ERROR(FsGetTreeSize(TargetPath, &reclaimed))) {
+    if (reclaimed >= needed) return TRUE;
+    needed -= reclaimed;
+  }
+  if (needed <= free) return TRUE;
+
+  FormatFileSize(needed, neededText, ARRAY_SIZE(neededText));
+  FormatFileSize(free, freeText, ARRAY_SIZE(freeText));
+  UnicodeSPrint(message, sizeof(message),
+                L"This needs about %s and %s has %s free.\nCopy anyway?",
+                neededText, volume->Name, freeText);
+  return (BOOLEAN)(GuiDrawConfirmDialog(L"Not enough room", message, FALSE) == 1);
+}
+
 static VOID ShowRecursiveSync(IN OUT PANEL* LeftPanel, IN OUT PANEL* RightPanel)
 {
   EC_SYNC_SUMMARY Summary;
@@ -553,8 +623,13 @@ static VOID ShowRecursiveSync(IN OUT PANEL* LeftPanel, IN OUT PANEL* RightPanel)
     return;
   }
 
-  GuiDrawSearchProgress(LeftPanel->Path, L"recursive SHA-256 compare", 0);
-  Status = SyncCompareTrees(LeftPanel->Path, RightPanel->Path, &Summary);
+  gTreeWalkTitle = L"Comparing trees with SHA-256";
+  GuiDrawTreeProgress(gTreeWalkTitle, LeftPanel->Path, 0, 0);
+  Status = SyncCompareTrees(LeftPanel->Path, RightPanel->Path, TreeWalkProgress, &Summary);
+  if (Status == EFI_ABORTED) {
+    GuiDrawMsgBox(L"Recursive compare", L"Comparison cancelled.");
+    return;
+  }
   if (EFI_ERROR(Status)) {
     UnicodeSPrint(Message, sizeof(Message), L"Comparison failed: %r", Status);
     GuiDrawMsgBox(L"Recursive compare", Message);
@@ -580,8 +655,9 @@ static VOID ShowRecursiveSync(IN OUT PANEL* LeftPanel, IN OUT PANEL* RightPanel)
                 Source, Destination);
   if (GuiDrawConfirmDialog(L"Confirm directory update", Message, FALSE) != 1) return;
 
-  GuiDrawSearchProgress(Source, L"updating destination", 0);
-  Status = SyncUpdateTree(Source, Destination, &Result);
+  gTreeWalkTitle = L"Updating the destination";
+  GuiDrawTreeProgress(gTreeWalkTitle, Source, 0, 0);
+  Status = SyncUpdateTree(Source, Destination, TreeWalkProgress, &Result);
   PanelRefresh(LeftPanel);
   PanelRefresh(RightPanel);
   UnicodeSPrint(Message, sizeof(Message),
@@ -589,7 +665,9 @@ static VOID ShowRecursiveSync(IN OUT PANEL* LeftPanel, IN OUT PANEL* RightPanel)
                 (UINT32)Result.CopiedFiles, (UINT32)Result.CopiedTrees,
                 (UINT32)Result.ReplacedEntries, (UINT32)Result.SkippedEqual,
                 (UINT32)Result.Errors, Status);
-  GuiDrawMsgBox(EFI_ERROR(Status) ? L"Directory update incomplete" : L"Directory update complete", Message);
+  GuiDrawMsgBox(Status == EFI_ABORTED ? L"Directory update cancelled"
+                : EFI_ERROR(Status)   ? L"Directory update incomplete"
+                                      : L"Directory update complete", Message);
 }
 
 static VOID RunCurrentEfiWithArguments(IN PANEL* ActivePanel)
@@ -699,7 +777,7 @@ static BOOLEAN ShowProgramMenu(
   STATIC CONST CHAR16* Lines[] = {
     L"Refresh both panels",
     L"Change active drive...  [F2]",
-    L"Find file in active tree...  [Alt+F7]",
+    L"Find file by name or contents...  [Alt+F7]",
     L"Compare panel directories  [=]",
     L"Recursive compare / update...",
     L"Checksum selected file...",
@@ -1163,6 +1241,8 @@ UefiMain (
                 CHAR16 targetPath[MAX_PATH_LEN] = { 0 };
                 BuildPathForGroupTarget(targetPath, targetInput, activePanel->Files[idx].Name);
 
+                if (!CopyHasRoom(srcPath, targetPath, targetInput)) break;
+
                 StrCpyS(gCopySrc, MAX_PATH_LEN, srcPath);
                 StrCpyS(gCopyDst, MAX_PATH_LEN, targetPath);
 
@@ -1199,6 +1279,8 @@ UefiMain (
 
             CHAR16 targetPath[MAX_PATH_LEN] = { 0 };
             BuildPathForSingleTarget(targetPath, targetInput, selected->Name, inactivePanel->Path);
+            if (!CopyHasRoom(srcPath, targetPath, targetPath)) break;
+
             StrCpyS(gCopySrc, MAX_PATH_LEN, srcPath);
             StrCpyS(gCopyDst, MAX_PATH_LEN, targetPath);
 

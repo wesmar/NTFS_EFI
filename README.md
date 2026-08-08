@@ -459,7 +459,7 @@ NTFS_EFI/
 │   ├── FileSystem.c          # VFS over EFI_FILE_PROTOCOL, recursive ops, ntfs.efi load and disconnect
 │   ├── Checksum.c            # SHA-256 and CRC32 streamed from EFI files, no external crypto
 │   ├── Sync.c                # Recursive tree compare and one-way update on top of Checksum.c
-│   ├── Search.c              # Recursive find by name or mask, bounded depth and hit count
+│   ├── Search.c              # Recursive find by name, mask or file contents, bounded and cancellable
 │   ├── FileProps.c           # DOS attribute bits and modification time of a single entry
 │   ├── UefiTools.c           # Read-only BootOrder / BootNext / Boot#### view
 │   ├── Navigation.c          # Per-panel path history, directory hotlist
@@ -527,10 +527,12 @@ flowchart LR
 | Panels | Two independent contexts: path, sort order, filter mask, tags, path history. Sort by name, extension, size or modification date; repeating the shortcut toggles the direction. Each panel footer carries the volume label and its free and total size, read when the listing is read rather than on every frame |
 | Volumes | FAT32 served by the firmware and NTFS served by `ntfs.efi` appear side by side as `fs0:` … `fsN:`. If the firmware has not connected the NTFS driver, EC loads it from `EC.ini`'s `NtfsDriverPath` or from its own directory, connects it to every handle, and disconnects it again on exit so the volume is unmounted cleanly |
 | File operations | Copy, move, rename, delete and create directory, all recursive, with a progress dialog and `Esc` to abort. A failed or aborted copy removes the partial destination file instead of leaving a misleading zero-byte entry. Failures are collected and reported per item, not as one abort |
+| Room to copy | Before a copy starts, the source is measured and the destination volume asked how much it has left. A shortfall asks rather than refuses: cluster slack is not counted and an overwrite gives its bytes back, so an estimate must not block a copy that would in fact have fitted |
 | Integrity | SHA-256 and CRC32 of the file under the cursor, computed in 64 KB reads with no external crypto library. `VerifyAfterCopy` re-reads both sides after every copy and fails the operation with `EFI_CRC_ERROR` on a mismatch |
 | Directory compare | `=` marks, on both panels at once, everything that differs by name, size or modification time; identical pairs stay unmarked, so what stays lit is exactly what would have to be copied. Directories compare by presence only |
-| Recursive compare | The F9 menu walks both trees and compares same-sized files by SHA-256, reporting left-only, right-only, different, equal and common-directory counts. It can then update either side one way: missing and differing entries are copied over, entries that exist only at the destination are kept |
+| Recursive compare | The F9 menu walks both trees and compares same-sized files by SHA-256, reporting left-only, right-only, different, equal and common-directory counts. It can then update either side one way: missing and differing entries are copied over, entries that exist only at the destination are kept. Both walks report where they are and stop on `Esc`: hashing a tree takes minutes, and a box that never changes is indistinguishable from a hang |
 | Search | `Alt+F7` walks the active panel's tree by name or mask, bounded at 24 levels and 512 hits, with `Esc` checked between directories. Taking a hit moves the panel to the directory holding it with the cursor already on the entry |
+| Search by contents | The same dialog asks for text the file must hold. Matching is case-insensitive ASCII, the same engine the viewer's `F7` uses, and files are read in 64 KB chunks that carry the tail of the previous chunk forward, so a match lying across a boundary is still found. The mask is what keeps it affordable — `*.ini` with a needle reads kilobytes per file, `*` with a needle reads the volume — so `Esc` is polled per file, not per directory |
 | Quick View | `Ctrl+Q` turns the passive panel into a preview of whatever the cursor is on: the first 32 KB as text, the same bytes as a hex dump when the content looks binary, or a count of files, subdirectories and immediate size for a directory |
 | Viewer and editor | Read-only viewer with text scrolling and a hex dump, `F4` switching between them at the same offset, `F7` to find plain ASCII and `F3` to repeat. The editor writes back in both text and hex mode |
 | Attributes | `Ctrl+F2` shows and edits the four DOS bits (read-only, hidden, system, archive) and the modification time; a field left alone is left alone on disk |
@@ -566,7 +568,7 @@ Inside the viewer: `F4` switches text and hex, `F7` finds ASCII text, `F3` finds
 |---|---|
 | Refresh both panels | Re-reads both listings |
 | Change active drive | Same list as `F2` |
-| Find file in active tree | Same as `Alt+F7`, for firmware that swallows `Alt` |
+| Find file by name or contents | Same as `Alt+F7`, for firmware that swallows `Alt` |
 | Compare panel directories | Same as `=` |
 | Recursive compare / update | Walks both trees with SHA-256, then optionally updates one side |
 | Checksum selected file | SHA-256 and CRC32 of the file under the cursor |
@@ -671,7 +673,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Probe battery on a fresh volume, Hyper-V | Interleaved writes, hole punching, 48 files created and deleted in the volume root, a nested tree deleted recursively | Every phase passes and the volume is left `chkdsk`-clean, including the `$BITMAP:$I30` state of the root directory, which earlier builds left with allocated blocks holding no keys |
 | Fill and drain one directory, Hyper-V | 2000 files with long names created in one directory through the driver, then every one of them deleted | 2000 created, 2000 deleted, `chkdsk` reports *found no problems*, and `$INDEX_ALLOCATION` is back to a single 4 KB block in one run — 88 bytes of attribute in the directory's own record |
 | WOF LZX read, Hyper-V | Four real Windows binaries compacted with `compact /c /exe:LZX` — 72 KB to 7.6 MB, up to 243 chunks — read back through the driver | Every file byte-exact against the same file read by Windows, checked by full-file checksum: `xcopy.exe` 73 728, `notepad.exe` 360 448, `cmd.exe` 344 064, `shell32.dll` 7 947 416 bytes |
-| EC self-test, Hyper-V | `EC.efi` built with `-SelfTest`, booted against a scripted NTFS fixture: recursive search, attribute and timestamp editing, panel compare, SHA-256 and CRC32 vectors, verified copy, Quick View, recursive tree compare and one-way update, volume details, viewer byte search | 45 checks, `passed=45 failed=0`, the VM powering itself off and the result read back from the ESP |
+| EC self-test, Hyper-V | `EC.efi` built with `-SelfTest`, booted against a scripted NTFS fixture: recursive search by name and by contents, attribute and timestamp editing, panel compare, SHA-256 and CRC32 vectors, verified copy, Quick View, recursive tree compare and one-way update with progress and cancellation, tree sizing, volume details, viewer byte search | 59 checks, `passed=59 failed=0`, the VM powering itself off and the result read back from the ESP. The content search is driven against a 70 000-byte file with the needle placed at offset 65 532, so a match across a read boundary fails the test rather than passing quietly |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
 

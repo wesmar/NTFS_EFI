@@ -730,6 +730,32 @@ EFI_STATUS FsCopyRecursive(
   return status;
 }
 
+EFI_STATUS FsOpenFileForRead(
+  IN  CONST CHAR16* Path,
+  OUT EFI_FILE_PROTOCOL** File
+) {
+  FS_VOLUME* volume = NULL;
+  CONST CHAR16* subPath = NULL;
+  EFI_FILE_PROTOCOL* root = NULL;
+  EFI_STATUS status;
+
+  if (Path == NULL || File == NULL) return EFI_INVALID_PARAMETER;
+  *File = NULL;
+
+  status = ParsePath(Path, &volume, &subPath);
+  if (EFI_ERROR(status)) return status;
+  status = volume->Sfs->OpenVolume(volume->Sfs, &root);
+  if (EFI_ERROR(status)) return status;
+
+  status = root->Open(root, File, (CHAR16*)subPath, EFI_FILE_MODE_READ, 0);
+  root->Close(root);
+  if (EFI_ERROR(status) || *File == NULL) {
+    *File = NULL;
+    return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
+  }
+  return EFI_SUCCESS;
+}
+
 EFI_STATUS FsReadFileToBuffer(
   IN  CONST CHAR16* Path,
   OUT VOID** Buffer,
@@ -1611,6 +1637,67 @@ FS_VOLUME* FsFindVolumeForPath(IN CONST CHAR16* Path)
     }
   }
   return NULL;
+}
+
+#define FS_TREE_SIZE_MAX_DEPTH 64
+
+static EFI_STATUS FsTreeSizeWalk(
+  IN CONST CHAR16* Path,
+  IN UINTN Depth,
+  IN OUT UINT64* Bytes
+) {
+  FS_FILE_ITEM* items = NULL;
+  UINTN count = 0;
+  EFI_STATUS status;
+
+  if (Depth > FS_TREE_SIZE_MAX_DEPTH) return EFI_BAD_BUFFER_SIZE;
+  status = FsListDirectory(Path, &items, &count);
+  if (EFI_ERROR(status)) return status;
+
+  for (UINTN i = 0; i < count; i++) {
+    if (StrCmp(items[i].Name, L".") == 0 || StrCmp(items[i].Name, L"..") == 0) continue;
+    if (items[i].IsDirectory) {
+      CHAR16 child[MAX_PATH_LEN];
+      FsCombinePath(child, Path, items[i].Name);
+      status = FsTreeSizeWalk(child, Depth + 1, Bytes);
+      if (EFI_ERROR(status)) break;
+    } else {
+      *Bytes += items[i].Size;
+    }
+  }
+
+  if (items != NULL) FreePool(items);
+  return status;
+}
+
+EFI_STATUS FsGetTreeSize(IN CONST CHAR16* Path, OUT UINT64* Bytes)
+{
+  BOOLEAN isDirectory = FALSE;
+
+  if (Path == NULL || Bytes == NULL) return EFI_INVALID_PARAMETER;
+  *Bytes = 0;
+  if (!FsFileExists(Path, &isDirectory)) return EFI_NOT_FOUND;
+  if (!isDirectory) {
+    EFI_FILE_PROTOCOL* parent = NULL;
+    EFI_FILE_PROTOCOL* file = NULL;
+    EFI_FILE_INFO* info;
+    UINTN infoSize = 0;
+    EFI_STATUS status = FsOpenForMeta(Path, &parent, &file, FALSE);
+
+    if (EFI_ERROR(status) || file == NULL) {
+      if (parent) parent->Close(parent);
+      return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
+    }
+    info = FsReadFileInfo(file, &infoSize);
+    if (info != NULL) {
+      *Bytes = info->FileSize;
+      FreePool(info);
+    }
+    file->Close(file);
+    if (parent) parent->Close(parent);
+    return info != NULL ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+  }
+  return FsTreeSizeWalk(Path, 0, Bytes);
 }
 
 EFI_STATUS FsRenameOrMove(IN CONST CHAR16* SrcPath, IN CONST CHAR16* DstPath)

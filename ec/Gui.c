@@ -265,7 +265,7 @@ UINTN GuiGetPageSize(UINTN PanelHeight)
   return (PanelHeight - chrome) / cellH;
 }
 
-static VOID FormatFileSize(UINT64 Size, CHAR16* Buffer, UINTN BufferSize)
+VOID FormatFileSize(UINT64 Size, CHAR16* Buffer, UINTN BufferSize)
 {
   if (Size < 1024) {
     UnicodeSPrint(Buffer, BufferSize * sizeof(CHAR16), L"%d B", Size);
@@ -1364,6 +1364,52 @@ VOID GuiDrawSearchProgress(
   UiGfxFlush();
 }
 
+VOID GuiDrawTreeProgress(
+  IN CONST CHAR16* Title,
+  IN CONST CHAR16* CurrentPath,
+  IN UINTN Files,
+  IN UINTN Directories
+) {
+  UINTN width, height;
+  UINTN cellW, cellH;
+  UINTN boxW, boxH, boxX, boxY;
+  UINTN maxChars;
+  CHAR16 line[MAX_PATH_LEN];
+
+  UiGfxGetDimensions(&width, &height);
+  UiGfxGetCellSize(&cellW, &cellH);
+
+  boxW = GuiDialogWidth(760);
+  boxH = cellH * 7;
+  boxX = (width - boxW) / 2;
+  boxY = (height - boxH) / 2;
+  maxChars = GuiCharsForWidth(boxW - 40, cellW);
+
+  UiGfxFillRectRgb(boxX, boxY, boxW, boxH, COLOR_BLUE_R, COLOR_BLUE_G, COLOR_BLUE_B);
+  DrawBorder(boxX, boxY, boxW, boxH, COLOR_YELLOW_R, COLOR_YELLOW_G, COLOR_YELLOW_B, 3);
+  GuiDrawUnicodeClippedAt(boxX + 20, boxY + 12, Title, maxChars,
+                          COLOR_YELLOW_R, COLOR_YELLOW_G, COLOR_YELLOW_B);
+
+  // The tail of the path, not its head: the volume and the top directories are
+  // the same for every entry, and the part that moves is the one worth showing.
+  if (CurrentPath != NULL) {
+    CONST CHAR16* shown = CurrentPath;
+    UINTN pathChars = StrLen(CurrentPath);
+    if (pathChars > maxChars) shown = CurrentPath + (pathChars - maxChars);
+    GuiDrawUnicodeClippedAt(boxX + 20, boxY + 12 + cellH * 2, shown, maxChars,
+                            COLOR_WHITE_R, COLOR_WHITE_G, COLOR_WHITE_B);
+  }
+
+  UnicodeSPrint(line, sizeof(line), L"%d files, %d directories",
+                (UINT32)Files, (UINT32)Directories);
+  GuiDrawUnicodeClippedAt(boxX + 20, boxY + 12 + cellH * 4, line, maxChars,
+                          COLOR_CYAN_R, COLOR_CYAN_G, COLOR_CYAN_B);
+
+  UiGfxDrawAsciiAt(boxX + 20, boxY + boxH - cellH - 12, "Esc cancels",
+                   COLOR_CYAN_R, COLOR_CYAN_G, COLOR_CYAN_B);
+  UiGfxFlush();
+}
+
 VOID GuiDrawHelp(VOID)
 {
   UINTN width, height;
@@ -1390,6 +1436,9 @@ VOID GuiDrawHelp(VOID)
     L"Enter opens directories and EFI apps",
     L"Backspace goes to the parent directory",
     L"Alt+F7 recursively finds a file by name or mask",
+    L"Alt+F7 also asks for text the file must contain; empty means any",
+    L"A content search reads every file the mask lets through, so narrow it",
+    L"Esc stops a search, a compare or an update where it stands",
     L"Ctrl+F2 attributes and modification time",
     L"Alt+F1 / Alt+F2 change left/right drive",
     L"Ctrl+F3 sort by name",

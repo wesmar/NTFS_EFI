@@ -128,6 +128,101 @@ static BOOLEAN StFindFixture(OUT CHAR16* Root, IN UINTN RootChars)
   return FALSE;
 }
 
+/*
+ * Searching by content rather than by name. The interesting case is the last
+ * one: a needle lying across the boundary between two reads is exactly what a
+ * chunked scan loses if it forgets to carry the tail of one chunk into the
+ * next, and no small fixture file would ever exercise it.
+ */
+static VOID StRunContentSearchChecks(IN CONST CHAR16* Fixture)
+{
+  STATIC CONST CHAR8 straddleNeedle[] = "STRADDLE";
+  CONST UINTN straddleSize = 70000;
+  CONST UINTN straddleAt = 65532;        /* crosses the 65536-byte read */
+  SEARCH_RESULT result;
+  CHAR16 straddlePath[MAX_PATH_LEN];
+  CHAR16 wideNeedle[3];
+  CHAR8* big;
+
+  // 1. only the file whose contents hold the text, out of three that match the mask
+  if (!EFI_ERROR(SearchCollect(Fixture, L"*.tag", L"middle", &result))) {
+    StLog("     content search: hits=%d files read=%d\n",
+          (UINT32)result.HitCount, (UINT32)result.FilesScanned);
+    StCheck(result.HitCount == 1 && StrCmp(result.Hits[0].Name, L"middle.tag") == 0,
+            "content search: only the file holding the text is a hit");
+    StCheck(result.FilesScanned == 3, "content search: every file matching the mask was read");
+    SearchFree(&result);
+  } else {
+    StCheck(FALSE, "content search: collect *.tag containing middle");
+  }
+
+  // 2. the match is case-insensitive, as it is in the viewer
+  if (!EFI_ERROR(SearchCollect(Fixture, L"*.tag", L"MIDDLE", &result))) {
+    StCheck(result.HitCount == 1, "content search: case does not matter");
+    SearchFree(&result);
+  } else {
+    StCheck(FALSE, "content search: collect *.tag containing MIDDLE");
+  }
+
+  // 3. text that is in none of them
+  if (!EFI_ERROR(SearchCollect(Fixture, L"*.tag", L"nowhere-at-all", &result))) {
+    StCheck(result.HitCount == 0 && result.FilesScanned == 3,
+            "content search: text present in no file returns nothing");
+    SearchFree(&result);
+  } else {
+    StCheck(FALSE, "content search: collect a needle nothing holds");
+  }
+
+  // 4. directories have no contents to look in, so they never answer
+  if (!EFI_ERROR(SearchCollect(Fixture, L"*", L"decoy", &result))) {
+    StCheck(result.HitCount == 1 && !result.Hits[0].IsDirectory &&
+            StrCmp(result.Hits[0].Name, L"decoy.txt") == 0,
+            "content search: directories are skipped, the file is found");
+    SearchFree(&result);
+  } else {
+    StCheck(FALSE, "content search: collect * containing decoy");
+  }
+
+  // 5. a needle that is not plain ASCII is refused, not truncated
+  wideNeedle[0] = L'a';
+  wideNeedle[1] = (CHAR16)0x0141;
+  wideNeedle[2] = L'\0';
+  StCheck(SearchCollect(Fixture, L"*.tag", wideNeedle, &result) == EFI_INVALID_PARAMETER,
+          "content search: a non-ASCII needle is refused");
+
+  // 6. a match straddling the boundary between two reads
+  big = AllocatePool(straddleSize);
+  if (big == NULL) {
+    StCheck(FALSE, "content search: allocate the straddle fixture");
+    return;
+  }
+  SetMem(big, straddleSize, 'x');
+  CopyMem(big + straddleAt, straddleNeedle, sizeof(straddleNeedle) - 1);
+  FsCombinePath(straddlePath, Fixture, L"straddle.bin");
+  if (EFI_ERROR(FsWriteFileFromBuffer(straddlePath, big, straddleSize))) {
+    FreePool(big);
+    StCheck(FALSE, "content search: write the straddle fixture");
+    return;
+  }
+  FreePool(big);
+
+  if (!EFI_ERROR(SearchCollect(Fixture, L"straddle.bin", L"STRADDLE", &result))) {
+    StCheck(result.HitCount == 1,
+            "content search: a match across a read boundary is still found");
+    SearchFree(&result);
+  } else {
+    StCheck(FALSE, "content search: collect straddle.bin");
+  }
+
+  if (!EFI_ERROR(SearchCollect(Fixture, L"straddle.bin", L"STRADDLF", &result))) {
+    StCheck(result.HitCount == 0,
+            "content search: one byte off the boundary text is not a match");
+    SearchFree(&result);
+  } else {
+    StCheck(FALSE, "content search: collect straddle.bin with a near miss");
+  }
+}
+
 static VOID StRunSearchChecks(IN CONST CHAR16* Fixture)
 {
   SEARCH_RESULT result;
@@ -135,7 +230,7 @@ static VOID StRunSearchChecks(IN CONST CHAR16* Fixture)
   UINTN i;
 
   // 1. every *.tag under the fixture, at three different depths
-  if (EFI_ERROR(SearchCollect(Fixture, L"*.tag", &result))) {
+  if (EFI_ERROR(SearchCollect(Fixture, L"*.tag", NULL, &result))) {
     StCheck(FALSE, "search: collect *.tag");
     return;
   }
@@ -150,7 +245,7 @@ static VOID StRunSearchChecks(IN CONST CHAR16* Fixture)
   SearchFree(&result);
 
   // 2. a mask that only the deepest file answers
-  if (!EFI_ERROR(SearchCollect(Fixture, L"deep*.tag", &result))) {
+  if (!EFI_ERROR(SearchCollect(Fixture, L"deep*.tag", NULL, &result))) {
     StCheck(result.HitCount == 1, "search: mask matches exactly one file");
     if (result.HitCount == 1) {
       StLog("     deep hit: %s\\%s\n", result.Hits[0].Dir, result.Hits[0].Name);
@@ -161,7 +256,7 @@ static VOID StRunSearchChecks(IN CONST CHAR16* Fixture)
   }
 
   // 3. directories match too, not only files
-  if (!EFI_ERROR(SearchCollect(Fixture, L"level*", &result))) {
+  if (!EFI_ERROR(SearchCollect(Fixture, L"level*", NULL, &result))) {
     UINTN dirs = 0;
     for (i = 0; i < result.HitCount; i++) {
       if (result.Hits[i].IsDirectory) dirs++;
@@ -173,12 +268,14 @@ static VOID StRunSearchChecks(IN CONST CHAR16* Fixture)
   }
 
   // 4. a mask nothing answers comes back empty, not with everything
-  if (!EFI_ERROR(SearchCollect(Fixture, L"*.nothing-matches-this", &result))) {
+  if (!EFI_ERROR(SearchCollect(Fixture, L"*.nothing-matches-this", NULL, &result))) {
     StCheck(result.HitCount == 0, "search: an unmatched mask returns nothing");
     SearchFree(&result);
   } else {
     StCheck(FALSE, "search: collect a non-matching mask");
   }
+
+  StRunContentSearchChecks(Fixture);
 }
 
 static VOID StRunMetaChecks(IN CONST CHAR16* Fixture)
@@ -419,6 +516,22 @@ static VOID StRunChecksumChecks(IN CONST CHAR16* Fixture)
           "quick view: bounded prefix read reports full size");
 }
 
+// Counts the entries the walk reports and, when StopAt is set, stops it there.
+// A walk that cannot be interrupted is the defect this guards against.
+static UINTN gStSyncTicks = 0;
+static UINTN gStSyncStopAt = 0;
+
+static BOOLEAN StSyncProgress(
+  IN CONST CHAR16* CurrentPath,
+  IN UINTN FilesSeen,
+  IN UINTN DirectoriesSeen
+) {
+  gStSyncTicks++;
+  if (CurrentPath == NULL || CurrentPath[0] == L'\0') return FALSE;
+  if (FilesSeen + DirectoriesSeen != gStSyncTicks) return FALSE;
+  return (BOOLEAN)(gStSyncStopAt == 0 || gStSyncTicks < gStSyncStopAt);
+}
+
 static VOID StRunSyncChecks(IN CONST CHAR16* Fixture)
 {
   STATIC CONST CHAR8 same[] = "same";
@@ -463,8 +576,12 @@ static VOID StRunSyncChecks(IN CONST CHAR16* Fixture)
           StWriteFixtureFile(targetNested, L"deep.bin", deepTarget, sizeof(deepTarget) - 1),
           "sync: create fixture files");
 
-  status = SyncCompareTrees(source, target, &summary);
+  gStSyncTicks = 0;
+  gStSyncStopAt = 0;
+  status = SyncCompareTrees(source, target, StSyncProgress, &summary);
   StCheck(!EFI_ERROR(status), "sync: recursive comparison completes");
+  StLog("     sync: progress reported %d entries\n", (UINT32)gStSyncTicks);
+  StCheck(gStSyncTicks == 6, "sync: progress reports every entry it walks, once each");
   if (!EFI_ERROR(status)) {
     StLog("     sync before: left=%d right=%d different=%d equal=%d dirs=%d\n",
           (UINT32)summary.LeftOnly, (UINT32)summary.RightOnly,
@@ -475,9 +592,35 @@ static VOID StRunSyncChecks(IN CONST CHAR16* Fixture)
             "sync: nested, size and same-size content differences counted exactly");
   }
 
-  status = SyncUpdateTree(source, target, &result);
+  // Stopping at the second entry must abort the whole walk, not just one level.
+  gStSyncTicks = 0;
+  gStSyncStopAt = 2;
+  status = SyncCompareTrees(source, target, StSyncProgress, &summary);
+  StCheck(status == EFI_ABORTED, "sync: refusing to continue aborts the comparison");
+  StCheck(gStSyncTicks == 2, "sync: the walk stops at the entry that refused");
+  gStSyncStopAt = 0;
+
+  // Sizing a copy up front: one file, then the whole tree above it.
+  {
+    CHAR16 onlySource[MAX_PATH_LEN];
+    CHAR16 missing[MAX_PATH_LEN];
+    UINT64 fileBytes = 0;
+    UINT64 treeBytes = 0;
+
+    FsCombinePath(onlySource, source, L"only-source.bin");
+    FsCombinePath(missing, Fixture, L"_no_such_entry");
+    StCheck(!EFI_ERROR(FsGetTreeSize(onlySource, &fileBytes)) && fileBytes == 11,
+            "tree size: a single file reports its own length");
+    StCheck(!EFI_ERROR(FsGetTreeSize(source, &treeBytes)) && treeBytes == 44,
+            "tree size: a directory reports everything below it");
+    StCheck(FsGetTreeSize(missing, &treeBytes) == EFI_NOT_FOUND,
+            "tree size: a path that does not exist is refused");
+  }
+
+  gStSyncTicks = 0;
+  status = SyncUpdateTree(source, target, StSyncProgress, &result);
   StCheck(!EFI_ERROR(status) && result.Errors == 0, "sync: one-way update completes");
-  status = SyncCompareTrees(source, target, &summary);
+  status = SyncCompareTrees(source, target, NULL, &summary);
   StCheck(!EFI_ERROR(status) && summary.LeftOnly == 0 && summary.Different == 0 &&
           summary.RightOnly == 1 && summary.EqualFiles == 5,
           "sync: destination matches source while target-only entry remains");

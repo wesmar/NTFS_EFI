@@ -121,29 +121,16 @@ static UINT32 Crc32Update(UINT32 Crc, IN CONST UINT8* Data, UINTN Length)
 
 EFI_STATUS ChecksumFile(IN CONST CHAR16* Path, OUT EC_FILE_CHECKSUM* Result)
 {
-  FS_VOLUME* volume;
-  EFI_FILE_PROTOCOL* root = NULL;
   EFI_FILE_PROTOCOL* file = NULL;
   VOID* buffer = NULL;
-  CONST CHAR16* subPath;
   EFI_STATUS status;
   SHA256_CONTEXT sha;
   UINT32 crc = 0xffffffffU;
 
   if (Path == NULL || Result == NULL) return EFI_INVALID_PARAMETER;
   ZeroMem(Result, sizeof(*Result));
-  volume = FsFindVolumeForPath(Path);
-  if (volume == NULL) return EFI_NOT_FOUND;
-  subPath = Path;
-  while (*subPath != L'\0' && *subPath != L':') subPath++;
-  if (*subPath != L':') return EFI_INVALID_PARAMETER;
-  subPath++;
-
-  status = volume->Sfs->OpenVolume(volume->Sfs, &root);
+  status = FsOpenFileForRead(Path, &file);
   if (EFI_ERROR(status)) return status;
-  status = root->Open(root, &file, (CHAR16*)subPath, EFI_FILE_MODE_READ, 0);
-  root->Close(root);
-  if (EFI_ERROR(status) || file == NULL) return status;
 
   buffer = AllocatePool(64 * 1024);
   if (buffer == NULL) {
