@@ -2,6 +2,7 @@
 #include "FileSystem.h"
 #include "Gui.h"
 #include "Config.h"
+#include "Checksum.h"
 
 #include <Library/UefiLib.h>
 #include <Library/UefiBootServicesTableLib.h>
@@ -87,6 +88,41 @@ EFI_STATUS FsGetVolumeInfo(
     if (info != NULL) FreePool(info);
   }
   
+  root->Close(root);
+  return status;
+}
+
+EFI_STATUS FsGetVolumeDetails(
+  IN FS_VOLUME* Vol,
+  OUT UINT64* TotalSize,
+  OUT UINT64* FreeSize,
+  OUT UINT32* BlockSize,
+  OUT BOOLEAN* ReadOnly,
+  OUT CHAR16* Label,
+  IN UINTN LabelSize
+) {
+  EFI_FILE_PROTOCOL* root = NULL;
+  EFI_FILE_SYSTEM_INFO* info = NULL;
+  UINTN infoSize = 0;
+  EFI_STATUS status;
+
+  if (Vol == NULL) return EFI_INVALID_PARAMETER;
+  status = Vol->Sfs->OpenVolume(Vol->Sfs, &root);
+  if (EFI_ERROR(status)) return status;
+  status = root->GetInfo(root, &gEfiFileSystemInfoGuid, &infoSize, NULL);
+  if (status == EFI_BUFFER_TOO_SMALL) {
+    info = AllocatePool(infoSize);
+    if (info == NULL) status = EFI_OUT_OF_RESOURCES;
+    else status = root->GetInfo(root, &gEfiFileSystemInfoGuid, &infoSize, info);
+  }
+  if (!EFI_ERROR(status) && info != NULL) {
+    if (TotalSize != NULL) *TotalSize = info->VolumeSize;
+    if (FreeSize != NULL) *FreeSize = info->FreeSpace;
+    if (BlockSize != NULL) *BlockSize = info->BlockSize;
+    if (ReadOnly != NULL) *ReadOnly = info->ReadOnly;
+    if (Label != NULL && LabelSize > 0) StrCpyS(Label, LabelSize, info->VolumeLabel);
+  }
+  if (info != NULL) FreePool(info);
   root->Close(root);
   return status;
 }
@@ -570,6 +606,15 @@ EFI_STATUS FsCopyFile(
   if (!EFI_ERROR(copyStatus) && totalCopied != fileSize) {
     copyStatus = EFI_DEVICE_ERROR;
   }
+  if (!EFI_ERROR(copyStatus) && gEcConfig.VerifyAfterCopy) {
+    EC_FILE_CHECKSUM sourceChecksum;
+    EC_FILE_CHECKSUM destinationChecksum;
+    EFI_STATUS sourceStatus = ChecksumFile(SrcPath, &sourceChecksum);
+    EFI_STATUS destinationStatus = ChecksumFile(DstPath, &destinationChecksum);
+    if (EFI_ERROR(sourceStatus)) copyStatus = sourceStatus;
+    else if (EFI_ERROR(destinationStatus)) copyStatus = destinationStatus;
+    else if (!ChecksumEqual(&sourceChecksum, &destinationChecksum)) copyStatus = EFI_CRC_ERROR;
+  }
   if (EFI_ERROR(copyStatus)) {
     FsDeleteFileOrDir(DstPath);
   }
@@ -759,6 +804,51 @@ EFI_STATUS FsReadFileToBuffer(
   return EFI_SUCCESS;
 }
 
+EFI_STATUS FsReadFilePrefix(
+  IN CONST CHAR16* Path,
+  OUT VOID* Buffer,
+  IN UINTN Capacity,
+  OUT UINTN* BytesRead,
+  OUT UINT64* TotalSize
+) {
+  FS_VOLUME* vol = NULL;
+  CONST CHAR16* subPath = NULL;
+  EFI_FILE_PROTOCOL* root = NULL;
+  EFI_FILE_PROTOCOL* file = NULL;
+  EFI_FILE_INFO* info = NULL;
+  UINTN infoSize = 0;
+  EFI_STATUS status;
+
+  if (Path == NULL || Buffer == NULL || Capacity == 0 || BytesRead == NULL || TotalSize == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+  *BytesRead = 0;
+  *TotalSize = 0;
+  status = ParsePath(Path, &vol, &subPath);
+  if (EFI_ERROR(status)) return status;
+  status = vol->Sfs->OpenVolume(vol->Sfs, &root);
+  if (EFI_ERROR(status)) return status;
+  status = root->Open(root, &file, (CHAR16*)subPath, EFI_FILE_MODE_READ, 0);
+  root->Close(root);
+  if (EFI_ERROR(status) || file == NULL) return status;
+
+  status = file->GetInfo(file, &gEfiFileInfoGuid, &infoSize, NULL);
+  if (status == EFI_BUFFER_TOO_SMALL) {
+    info = AllocatePool(infoSize);
+    if (info == NULL) status = EFI_OUT_OF_RESOURCES;
+    else status = file->GetInfo(file, &gEfiFileInfoGuid, &infoSize, info);
+  }
+  if (!EFI_ERROR(status) && info != NULL) *TotalSize = info->FileSize;
+  if (info != NULL) FreePool(info);
+  if (!EFI_ERROR(status)) {
+    UINTN readSize = Capacity;
+    status = file->Read(file, &readSize, Buffer);
+    if (!EFI_ERROR(status)) *BytesRead = readSize;
+  }
+  file->Close(file);
+  return status;
+}
+
 static VOID FsConnectAll(VOID)
 {
   UINTN handleCount = 0;
@@ -777,6 +867,12 @@ static VOID FsConnectAll(VOID)
     }
     FreePool(handles);
   }
+}
+
+VOID FsRescanDevices(VOID)
+{
+  FsConnectAll();
+  FsInit();
 }
 
 static EFI_STATUS FsLoadNtfsDriverFromRoot(
@@ -941,7 +1037,11 @@ VOID FsUnmountAllNtfs(VOID)
   }
 }
 
-EFI_STATUS FsStartEfiApp(IN EFI_HANDLE ImageHandle, IN CONST CHAR16* Path)
+EFI_STATUS FsStartEfiAppWithArgs(
+  IN EFI_HANDLE ImageHandle,
+  IN CONST CHAR16* Path,
+  IN CONST CHAR16* Arguments
+)
 {
   FS_VOLUME* vol = NULL;
   CONST CHAR16* subPath = NULL;
@@ -968,10 +1068,53 @@ EFI_STATUS FsStartEfiApp(IN EFI_HANDLE ImageHandle, IN CONST CHAR16* Path)
   FreePool(devPath);
 
   if (!EFI_ERROR(status)) {
-    // Start application
+    VOID* loadOptions = NULL;
+    if (Arguments != NULL && Arguments[0] != L'\0') {
+      EFI_LOADED_IMAGE_PROTOCOL* loadedImage = NULL;
+      EFI_GUID loadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+      UINTN optionBytes = (StrLen(Arguments) + 1) * sizeof(CHAR16);
+      loadOptions = AllocateCopyPool(optionBytes, Arguments);
+      // An image that was loaded but never started stays in memory until it is
+      // unloaded explicitly; StartImage only cleans up after itself.
+      if (loadOptions == NULL) {
+        gBS->UnloadImage(appHandle);
+        return EFI_OUT_OF_RESOURCES;
+      }
+      status = gBS->HandleProtocol(appHandle, &loadedImageGuid, (VOID**)&loadedImage);
+      if (EFI_ERROR(status) || loadedImage == NULL) {
+        FreePool(loadOptions);
+        gBS->UnloadImage(appHandle);
+        return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
+      }
+      loadedImage->LoadOptions = loadOptions;
+      loadedImage->LoadOptionsSize = (UINT32)optionBytes;
+    }
     status = gBS->StartImage(appHandle, NULL, NULL);
+    if (loadOptions != NULL) FreePool(loadOptions);
   }
 
+  return status;
+}
+
+EFI_STATUS FsStartEfiApp(IN EFI_HANDLE ImageHandle, IN CONST CHAR16* Path)
+{
+  return FsStartEfiAppWithArgs(ImageHandle, Path, NULL);
+}
+
+EFI_STATUS FsStartEfiDriver(IN EFI_HANDLE ImageHandle, IN CONST CHAR16* Path)
+{
+  FS_VOLUME* vol = NULL;
+  CONST CHAR16* subPath = NULL;
+  EFI_DEVICE_PATH_PROTOCOL* devPath;
+  EFI_HANDLE driverHandle = NULL;
+  EFI_STATUS status = ParsePath(Path, &vol, &subPath);
+  if (EFI_ERROR(status)) return status;
+  devPath = FileDevicePath(vol->Handle, (CHAR16*)subPath);
+  if (devPath == NULL) return EFI_OUT_OF_RESOURCES;
+  status = gBS->LoadImage(FALSE, ImageHandle, devPath, NULL, 0, &driverHandle);
+  FreePool(devPath);
+  if (!EFI_ERROR(status)) status = gBS->StartImage(driverHandle, NULL, NULL);
+  if (!EFI_ERROR(status)) FsRescanDevices();
   return status;
 }
 
@@ -1300,6 +1443,174 @@ EFI_STATUS FsDeleteRecursive(IN CONST CHAR16* Path) {
   }
 
   return status;
+}
+
+/*
+ * Metadata is read and written through one EFI_FILE_INFO round trip: GetInfo
+ * hands back the whole record, the caller's fields replace what they asked to
+ * change, and SetInfo puts it back. Anything the caller passes as NULL is
+ * copied through untouched - the driver writes every field of the record it
+ * receives, so a partial update has to preserve the rest here.
+ *
+ * The file is opened for write because SetInfo on a read-only handle is
+ * refused, and a directory is opened the same way its own entry is stored.
+ */
+static EFI_STATUS FsOpenForMeta(
+  IN  CONST CHAR16* Path,
+  OUT EFI_FILE_PROTOCOL** Parent,
+  OUT EFI_FILE_PROTOCOL** File,
+  IN  BOOLEAN ForWrite
+) {
+  CHAR16 childName[256];
+  UINT64 mode = ForWrite ? (EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE) : EFI_FILE_MODE_READ;
+  EFI_STATUS status;
+  BOOLEAN isDir = FALSE;
+
+  if (!FsFileExists(Path, &isDir)) {
+    return EFI_NOT_FOUND;
+  }
+  status = FsOpenParentAndChild(Path, mode, isDir ? EFI_FILE_DIRECTORY : 0,
+                                Parent, File, childName);
+  if (EFI_ERROR(status) && ForWrite) {
+    /* a ReadOnly file refuses a write handle - that is exactly the file whose
+     * attribute the user is trying to clear, so fall back to a read handle and
+     * let SetInfo decide */
+    status = FsOpenParentAndChild(Path, EFI_FILE_MODE_READ, isDir ? EFI_FILE_DIRECTORY : 0,
+                                  Parent, File, childName);
+  }
+  return status;
+}
+
+static EFI_FILE_INFO* FsReadFileInfo(IN EFI_FILE_PROTOCOL* File, OUT UINTN* InfoSize)
+{
+  EFI_FILE_INFO* info = NULL;
+  UINTN size = 0;
+  EFI_STATUS status;
+
+  *InfoSize = 0;
+  status = File->GetInfo(File, &gEfiFileInfoGuid, &size, NULL);
+  if (status != EFI_BUFFER_TOO_SMALL || size == 0) {
+    return NULL;
+  }
+  info = AllocatePool(size);
+  if (info == NULL) {
+    return NULL;
+  }
+  if (EFI_ERROR(File->GetInfo(File, &gEfiFileInfoGuid, &size, info))) {
+    FreePool(info);
+    return NULL;
+  }
+  *InfoSize = size;
+  return info;
+}
+
+EFI_STATUS FsGetFileMeta(
+  IN  CONST CHAR16* Path,
+  OUT UINT64* Attributes,
+  OUT EFI_TIME* CreateTime,
+  OUT EFI_TIME* ModificationTime,
+  OUT EFI_TIME* LastAccessTime
+) {
+  EFI_FILE_PROTOCOL* parent = NULL;
+  EFI_FILE_PROTOCOL* file = NULL;
+  EFI_FILE_INFO* info;
+  UINTN infoSize = 0;
+  EFI_STATUS status;
+
+  if (Path == NULL) return EFI_INVALID_PARAMETER;
+
+  status = FsOpenForMeta(Path, &parent, &file, FALSE);
+  if (EFI_ERROR(status) || file == NULL) {
+    if (parent) parent->Close(parent);
+    return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
+  }
+
+  info = FsReadFileInfo(file, &infoSize);
+  if (info == NULL) {
+    file->Close(file);
+    if (parent) parent->Close(parent);
+    return EFI_DEVICE_ERROR;
+  }
+
+  if (Attributes)       *Attributes = info->Attribute;
+  if (CreateTime)       *CreateTime = info->CreateTime;
+  if (ModificationTime) *ModificationTime = info->ModificationTime;
+  if (LastAccessTime)   *LastAccessTime = info->LastAccessTime;
+
+  FreePool(info);
+  file->Close(file);
+  if (parent) parent->Close(parent);
+  return EFI_SUCCESS;
+}
+
+EFI_STATUS FsSetFileMeta(
+  IN CONST CHAR16* Path,
+  IN CONST UINT64* Attributes,
+  IN CONST EFI_TIME* ModificationTime
+) {
+  EFI_FILE_PROTOCOL* parent = NULL;
+  EFI_FILE_PROTOCOL* file = NULL;
+  EFI_FILE_INFO* info;
+  UINTN infoSize = 0;
+  EFI_STATUS status;
+
+  if (Path == NULL || (Attributes == NULL && ModificationTime == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  status = FsOpenForMeta(Path, &parent, &file, TRUE);
+  if (EFI_ERROR(status) || file == NULL) {
+    if (parent) parent->Close(parent);
+    return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
+  }
+
+  info = FsReadFileInfo(file, &infoSize);
+  if (info == NULL) {
+    file->Close(file);
+    if (parent) parent->Close(parent);
+    return EFI_DEVICE_ERROR;
+  }
+
+  if (Attributes != NULL) {
+    /* only the four DOS bits are the caller's to set; EFI_FILE_DIRECTORY and
+     * anything the firmware keeps in the high bits stay as they were */
+    UINT64 keep = info->Attribute & ~(UINT64)(EFI_FILE_READ_ONLY | EFI_FILE_HIDDEN |
+                                              EFI_FILE_SYSTEM | EFI_FILE_ARCHIVE);
+    info->Attribute = keep | (*Attributes & (EFI_FILE_READ_ONLY | EFI_FILE_HIDDEN |
+                                             EFI_FILE_SYSTEM | EFI_FILE_ARCHIVE));
+  }
+  if (ModificationTime != NULL) {
+    info->ModificationTime = *ModificationTime;
+  }
+
+  status = file->SetInfo(file, &gEfiFileInfoGuid, infoSize, info);
+
+  FreePool(info);
+  file->Flush(file);
+  file->Close(file);
+  if (parent) parent->Close(parent);
+
+  if (!EFI_ERROR(status)) {
+    FsFlushVolumeForPath(Path);
+  }
+  return status;
+}
+
+FS_VOLUME* FsFindVolumeForPath(IN CONST CHAR16* Path)
+{
+  UINTN colIdx = 0;
+  UINTN v;
+
+  if (Path == NULL || Path[0] == L'\0') return NULL;
+  while (Path[colIdx] != L'\0' && Path[colIdx] != L':') colIdx++;
+  if (Path[colIdx] != L':') return NULL;
+
+  for (v = 0; v < gVolumeCount; v++) {
+    if (StrnCmp(gVolumes[v].Name, Path, colIdx + 1) == 0) {
+      return &gVolumes[v];
+    }
+  }
+  return NULL;
 }
 
 EFI_STATUS FsRenameOrMove(IN CONST CHAR16* SrcPath, IN CONST CHAR16* DstPath)

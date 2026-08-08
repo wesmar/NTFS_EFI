@@ -27,6 +27,11 @@
     <EnableFuzzer>false</EnableFuzzer>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <!-- Scripted self-test path. 0 in every normal build: the module compiles
+         to nothing and main never calls it. build.ps1 -SelfTest sets it to 1. -->
+    <EcSelfTest Condition="'$(EcSelfTest)'==''">0</EcSelfTest>
+  </PropertyGroup>
   <PropertyGroup Label="UserMacros">
     <EDK_PATH>C:\Projekty\VisualUEFI\edk2</EDK_PATH>
   </PropertyGroup>
@@ -60,6 +65,7 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
+      <PreprocessorDefinitions>EC_SELFTEST=$(EcSelfTest);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <Optimization>MaxSpeed</Optimization>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
@@ -108,10 +114,16 @@
     <ClCompile Include="Panel.c" />
     <ClCompile Include="PanelOps.c" />
     <ClCompile Include="Gui.c" />
+    <ClCompile Include="Search.c" />
+    <ClCompile Include="FileProps.c" />
+    <ClCompile Include="SelfTest.c" />
     <ClCompile Include="Viewer.c" />
     <ClCompile Include="Editor.c" />
     <ClCompile Include="Config.c" />
     <ClCompile Include="Navigation.c" />
+    <ClCompile Include="Checksum.c" />
+    <ClCompile Include="Sync.c" />
+    <ClCompile Include="UefiTools.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="BmpFont.h" />
@@ -119,11 +131,18 @@
     <ClInclude Include="FileSystem.h" />
     <ClInclude Include="Panel.h" />
     <ClInclude Include="PanelOps.h" />
+    <ClInclude Include="Colors.h" />
     <ClInclude Include="Gui.h" />
+    <ClInclude Include="Search.h" />
+    <ClInclude Include="FileProps.h" />
+    <ClInclude Include="SelfTest.h" />
     <ClInclude Include="Viewer.h" />
     <ClInclude Include="Editor.h" />
     <ClInclude Include="Config.h" />
     <ClInclude Include="Navigation.h" />
+    <ClInclude Include="Checksum.h" />
+    <ClInclude Include="Sync.h" />
+    <ClInclude Include="UefiTools.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\EC.ini" />

@@ -101,7 +101,7 @@ Design constraints that shaped the code:
 | Binary | Role | Project |
 |---|---|---|
 | `ntfs.efi` | UEFI driver (`EFI_DRIVER_BINDING_PROTOCOL`) — the NTFS read and write engine; mounts every NTFS partition it is connected to | `src/ntfs.vcxproj` |
-| `EC.efi` | UEFI application on GOP — dual-panel file manager with viewer, editor and driver loader | `ec/EC.vcxproj` |
+| `EC.efi` | UEFI application on GOP — dual-panel file manager with viewer, editor, recursive search, SHA-256 integrity tools and driver loader | `ec/EC.vcxproj` |
 | `ntfs_probe.efi` | UEFI application — self-loading functional test harness and tree-copy benchmark | `probe/ntfs_probe.vcxproj` |
 
 All three link only against the EDK2 static libraries shipped in `lib/`: `BaseLib`, `BasePrintLib`, `UefiApplicationEntryPoint`, `UefiBootServicesTableLib`, `UefiLib`, `UefiMemoryAllocationLib`, `UefiMemoryLib`, `UefiRuntimeServicesTableLib`. `src/ntfs_entry.c` supplies the `ProcessLibraryConstructorList` / `ProcessModuleEntryPointList` plumbing that the EDK2 AutoGen step would normally generate, which is what makes the plain-MSVC build possible.
@@ -446,16 +446,23 @@ NTFS_EFI/
 │   └── DebugLog.c            # Optional ESP log, compiled out unless ENABLE_DEBUG_LOG is set
 │
 ├── ec/                       # EC.efi — EFI Commander
-│   ├── Main.c                # Entry point, event loop, key dispatch, quick-find
+│   ├── Main.c                # Entry point, event loop, key dispatch, F9 menus, quick-find
 │   ├── UiConsole.c           # Direct GOP framebuffer output, glyph and rectangle blitting
-│   ├── Gui.c                 # Panels, bars, dialogs, input boxes, progress, help, palette
+│   ├── Gui.c                 # Panels, legend, dialogs, list picker, Quick View, help
+│   ├── Colors.h              # The whole palette in one place, shared by every drawing file
 │   ├── Panel.c               # Panel state, sort by name/extension/size/date, filter mask, scrolling
-│   ├── PanelOps.c            # Tagging: all, none, by mask, invert
+│   ├── PanelOps.c            # Tagging: all, none, by mask, invert, panel-against-panel compare
 │   ├── FileSystem.c          # VFS over EFI_FILE_PROTOCOL, recursive ops, ntfs.efi load and disconnect
+│   ├── Checksum.c            # SHA-256 and CRC32 streamed from EFI files, no external crypto
+│   ├── Sync.c                # Recursive tree compare and one-way update on top of Checksum.c
+│   ├── Search.c              # Recursive find by name or mask, bounded depth and hit count
+│   ├── FileProps.c           # DOS attribute bits and modification time of a single entry
+│   ├── UefiTools.c           # Read-only BootOrder / BootNext / Boot#### view
 │   ├── Navigation.c          # Per-panel path history, directory hotlist
-│   ├── Viewer.c              # Read-only viewer: text scrolling and hex dump
-│   ├── Editor.c              # Text editor: line buffer, cursor, save
-│   ├── Config.c              # EC.ini parser, driver-path resolution
+│   ├── Viewer.c              # Read-only viewer: text scrolling, hex dump, byte search
+│   ├── Editor.c              # Text and hex editor: line buffer, cursor, save
+│   ├── Config.c              # EC.ini parser and writer, driver-path resolution
+│   ├── SelfTest.c            # Scripted self-test, compiled out unless EC_SELFTEST is set
 │   └── BmpFont.h             # Embedded 8x16 monospace glyph matrix
 │
 ├── probe/
@@ -481,10 +488,13 @@ flowchart LR
     KEY["Key event loop<br/>SimpleTextInputEx with modifier state"]
     PANELS["Two panel contexts<br/>path, sort, filter, tags, history"]
     OPS["Operations<br/>copy, move, delete, mkdir, recursive"]
+    INTEG["Integrity<br/>SHA-256, CRC32, tree compare and update"]
+    FIND["Search<br/>recursive by name or mask"]
     VFS["VFS layer<br/>FAT32 and NTFS behind EFI_FILE_PROTOCOL"]
     LOADER["Driver loader<br/>ntfs.efi LoadImage and clean disconnect"]
-    VIEW["Viewer<br/>text and hex"]
-    EDIT["Editor<br/>line buffer and save"]
+    VIEW["Viewer<br/>text, hex and byte search"]
+    EDIT["Editor<br/>text and hex, save in place"]
+    QV["Quick View<br/>text, hex or directory summary"]
     FONT["8x16 bitmap font renderer<br/>BmpFont.h"]
     GOP["EFI_GRAPHICS_OUTPUT_PROTOCOL<br/>direct framebuffer blit"]
 
@@ -492,13 +502,37 @@ flowchart LR
     PANELS --> OPS
     PANELS --> VIEW
     PANELS --> EDIT
+    PANELS --> QV
+    PANELS --> FIND
+    OPS --> INTEG
     OPS --> VFS
+    INTEG --> VFS
+    FIND --> VFS
     VFS --> LOADER
     PANELS --> FONT
     VIEW --> FONT
     EDIT --> FONT
+    QV --> FONT
     FONT --> GOP
 ```
+
+### What it does
+
+| Area | Detail |
+|---|---|
+| Panels | Two independent contexts: path, sort order, filter mask, tags, path history. Sort by name, extension, size or modification date; repeating the shortcut toggles the direction. Each panel footer carries the volume label and its free and total size, read when the listing is read rather than on every frame |
+| Volumes | FAT32 served by the firmware and NTFS served by `ntfs.efi` appear side by side as `fs0:` … `fsN:`. If the firmware has not connected the NTFS driver, EC loads it from `EC.ini`'s `NtfsDriverPath` or from its own directory, connects it to every handle, and disconnects it again on exit so the volume is unmounted cleanly |
+| File operations | Copy, move, rename, delete and create directory, all recursive, with a progress dialog and `Esc` to abort. A failed or aborted copy removes the partial destination file instead of leaving a misleading zero-byte entry. Failures are collected and reported per item, not as one abort |
+| Integrity | SHA-256 and CRC32 of the file under the cursor, computed in 64 KB reads with no external crypto library. `VerifyAfterCopy` re-reads both sides after every copy and fails the operation with `EFI_CRC_ERROR` on a mismatch |
+| Directory compare | `=` marks, on both panels at once, everything that differs by name, size or modification time; identical pairs stay unmarked, so what stays lit is exactly what would have to be copied. Directories compare by presence only |
+| Recursive compare | The F9 menu walks both trees and compares same-sized files by SHA-256, reporting left-only, right-only, different, equal and common-directory counts. It can then update either side one way: missing and differing entries are copied over, entries that exist only at the destination are kept |
+| Search | `Alt+F7` walks the active panel's tree by name or mask, bounded at 24 levels and 512 hits, with `Esc` checked between directories. Taking a hit moves the panel to the directory holding it with the cursor already on the entry |
+| Quick View | `Ctrl+Q` turns the passive panel into a preview of whatever the cursor is on: the first 32 KB as text, the same bytes as a hex dump when the content looks binary, or a count of files, subdirectories and immediate size for a directory |
+| Viewer and editor | Read-only viewer with text scrolling and a hex dump, `F4` switching between them at the same offset, `F7` to find plain ASCII and `F3` to repeat. The editor writes back in both text and hex mode |
+| Attributes | `Ctrl+F2` shows and edits the four DOS bits (read-only, hidden, system, archive) and the modification time; a field left alone is left alone on disk |
+| UEFI tools | Volume details (label, total, free, block size, read-only), a device and filesystem rescan, loading a selected image as an EFI driver, and a read-only view of `BootOrder`, `BootNext` and each `Boot####` description |
+| Running images | `Enter` launches an EFI application; the F9 menu can start one with an argument string passed as `LoadOptions`, the way the UEFI Shell would |
+| Settings | Every item in `F9 → Settings` is written to `EC.ini` the moment it changes |
 
 ### Keyboard reference
 
@@ -508,20 +542,42 @@ flowchart LR
 | `F3` | View file | `F4` | Edit file |
 | `F5` | Copy, recursive | `F6` | Rename or move |
 | `F7` | Create directory | `F8` / `Delete` | Delete, recursive |
-| `F9` | Rescan volumes and refresh | `F10` | Quit |
-| `Alt+F1` / `Alt+F2` | Change left / right drive | `Alt+F10` | Directory hotlist |
-| `Alt+←` / `Alt+→` | Path history back / forward | `Ctrl+F12` | Panel filter mask, `*` clears |
+| `F9` | Program menu | `F10` | Quit |
+| `Alt+F1` / `Alt+F2` | Change left / right drive | `Alt+F7` | Find in the active tree |
+| `Alt+F10` | Directory hotlist | `Alt+←` / `Alt+→` | Path history back / forward |
+| `Ctrl+Q` | Quick View in the passive panel | `Ctrl+F2` | Attributes and modification time |
 | `Ctrl+F3` / `Ctrl+F4` | Sort by name / extension | `Ctrl+F5` / `Ctrl+F6` | Sort by date / size |
-| `Insert` / `Space` | Tag current item | `Ctrl+A` / `Ctrl+U` | Tag all / clear tags |
-| `+` / `-` | Tag / untag by mask | `*` | Invert tags |
+| `Ctrl+F12` | Panel filter mask, `*` clears | `Ctrl+A` / `Ctrl+U` | Tag all / clear tags |
+| `Insert` / `Space` | Tag current item | `+` / `-` | Tag / untag by mask |
+| `*` | Invert tags | `=` | Tag what differs between the panels |
 | `Tab` | Switch active panel | `Enter` | Enter directory or launch an EFI application |
-| letters | Quick prefix jump | `/` then `N` | Find anywhere in name, repeat |
+| `Backspace` | Parent directory | letters | Quick prefix jump |
+| `/` then `N` | Find anywhere in name, repeat | `Esc` | Close a dialog, abort an operation |
 
-Repeating the same sort shortcut toggles ascending and descending.
+Inside the viewer: `F4` switches text and hex, `F7` finds ASCII text, `F3` finds the next occurrence. Inside the editor: `F2` saves, `F4` switches text and hex.
+
+### The F9 menu
+
+| Entry | What it does |
+|---|---|
+| Refresh both panels | Re-reads both listings |
+| Change active drive | Same list as `F2` |
+| Find file in active tree | Same as `Alt+F7`, for firmware that swallows `Alt` |
+| Compare panel directories | Same as `=` |
+| Recursive compare / update | Walks both trees with SHA-256, then optionally updates one side |
+| Checksum selected file | SHA-256 and CRC32 of the file under the cursor |
+| Toggle Quick View | Same as `Ctrl+Q` |
+| Run selected EFI with arguments | `LoadImage`, `LoadOptions`, `StartImage` |
+| UEFI tools | Volume details, rescan, load driver, boot entries |
+| Selection tools | The `+`, `-`, `*`, `Ctrl+A`, `Ctrl+U` operations as menu items |
+| Set active panel filter | Same as `Ctrl+F12`, temporary for this session |
+| Directory hotlist | Same as `Alt+F10` |
+| Settings | The `EC.ini` options below, saved on every change |
+| Help | Same as `F1` |
 
 ### `EC.ini`
 
-Loaded from the application directory, then the volume root, then `\EFI\BOOT\EC.ini`. Lines starting with `#`, `;` or `[` are ignored; values accept `1/0`, `yes/no`, `on/off`.
+Read at startup from the directory EC was launched from, then from the volume root, then from `\EFI\BOOT\EC.ini`. Lines starting with `#`, `;` or `[` are ignored; boolean values accept `1/0`, `yes/no`, `on/off`, `true/false`.
 
 | Key | Effect |
 |---|---|
@@ -529,10 +585,15 @@ Loaded from the application directory, then the volume root, then `\EFI\BOOT\EC.
 | `ConfirmOverwrite` | Ask before overwriting an existing target |
 | `ShowSuccessMessages` | Report individual successful operations |
 | `ShowOperationSummary` | Report a summary after group operations |
+| `VerifyAfterCopy` | Re-read source and destination after every copy and compare SHA-256 |
 | `DefaultLeft` / `DefaultRight` | Startup path per panel |
 | `FilterLeft` / `FilterRight` | Startup filter mask per panel |
 | `NtfsDriverPath` (alias `NtfsDriver`) | Where to find `ntfs.efi`; defaults to the application directory |
 | `HotDir1` … `HotDir9` | Directory hotlist entries reached with `Alt+F10` |
+
+Every setting reachable from `F9 → Settings` is written back the moment it changes. The file is created on first write if it does not exist, next to the running `EC.efi` — usually `\EFI\BOOT\EC.ini` — and if an existing file was found somewhere else at startup, that file is the one updated. A write that fails, for instance on a read-only volume, is reported rather than swallowed.
+
+The one exception is the filter set with `Ctrl+F12` or from the filter entry in the main F9 menu: it applies to the running session only. To keep a filter across restarts, set it under `F9 → Settings → Left/Right filter`.
 
 ---
 
@@ -580,7 +641,12 @@ flowchart LR
 .\tests\make-bigtest.ps1 -TargetGB 7 -MaxFiles 20000
 .\tests\hyperv-bigtest.ps1 -SkipBuild
 .\tests\verify-bigtest.ps1
+
+# EC self-test - Hyper-V Gen 2, ~2 min, nothing interactive
+.\tests\hyperv-ectest.ps1
 ```
+
+The EC self-test is a separate binary: `build.ps1 -SelfTest` defines `EC_SELFTEST`, which is the only thing that compiles `SelfTest.c` into anything at all. Even that build runs the checks only when `\_ECTEST.on` is present on the boot volume, writes its report to `\_ECTEST_RESULT.txt` and powers the machine off. The release binary carries neither the code nor the flag check, and the harness stages the test image outside `bin\` and rebuilds the release binary immediately, so a self-test image cannot end up on a rescue stick by accident.
 
 Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - copy is byte-exact and chkdsk-clean`.
 
@@ -601,6 +667,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Probe battery on a fresh volume, Hyper-V | Interleaved writes, hole punching, 48 files created and deleted in the volume root, a nested tree deleted recursively | Every phase passes and the volume is left `chkdsk`-clean, including the `$BITMAP:$I30` state of the root directory, which earlier builds left with allocated blocks holding no keys |
 | Fill and drain one directory, Hyper-V | 2000 files with long names created in one directory through the driver, then every one of them deleted | 2000 created, 2000 deleted, `chkdsk` reports *found no problems*, and `$INDEX_ALLOCATION` is back to a single 4 KB block in one run — 88 bytes of attribute in the directory's own record |
 | WOF LZX read, Hyper-V | Four real Windows binaries compacted with `compact /c /exe:LZX` — 72 KB to 7.6 MB, up to 243 chunks — read back through the driver | Every file byte-exact against the same file read by Windows, checked by full-file checksum: `xcopy.exe` 73 728, `notepad.exe` 360 448, `cmd.exe` 344 064, `shell32.dll` 7 947 416 bytes |
+| EC self-test, Hyper-V | `EC.efi` built with `-SelfTest`, booted against a scripted NTFS fixture: recursive search, attribute and timestamp editing, panel compare, SHA-256 and CRC32 vectors, verified copy, Quick View, recursive tree compare and one-way update, volume details, viewer byte search | 45 checks, `passed=45 failed=0`, the VM powering itself off and the result read back from the ESP |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
 
@@ -757,7 +824,9 @@ cd NTFS_EFI
 
 `build.ps1` locates MSBuild through `vswhere.exe`, builds `src\ntfs.vcxproj`, `ec\EC.vcxproj` and `probe\ntfs_probe.vcxproj` in `Release|x64`, moves the binaries into `bin\`, and cleans the intermediates.
 
-The driver and the probe build at `/W4 /WX` — warning-free, with warnings promoted to errors — and `/external:W3` keeps the vendored EDK2 headers from breaking that. `/GS-` and disabled exception handling stay as they are: freestanding UEFI has no runtime for stack cookies or C++ exceptions.
+All three build at `/W4 /WX` — warning-free, with warnings promoted to errors — and `/external:W3` keeps the vendored EDK2 headers from breaking that. `/GS-` and disabled exception handling stay as they are: freestanding UEFI has no runtime for stack cookies or C++ exceptions.
+
+`.\build.ps1 -SelfTest` produces the same application with `EC_SELFTEST=1`, which is what compiles `SelfTest.c` in; the default build defines it as `0` and the file collapses to nothing.
 
 | Output | Description |
 |---|---|

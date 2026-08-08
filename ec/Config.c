@@ -13,6 +13,9 @@
 
 EC_CONFIG gEcConfig;
 
+static EFI_HANDLE gConfigDeviceHandle = NULL;
+static CHAR16 gConfigIniPath[MAX_PATH_LEN];
+
 static VOID ConfigSetDefaults(VOID)
 {
   ZeroMem(&gEcConfig, sizeof(gEcConfig));
@@ -136,12 +139,12 @@ static VOID ConfigResolveNtfsDriverPath(VOID)
 {
   CHAR16 RawPath[MAX_PATH_LEN];
 
-  if (gEcConfig.NtfsDriverPath[0] == L'\0') {
+  if (gEcConfig.NtfsDriverSetting[0] == L'\0') {
     ConfigJoinPath(gEcConfig.NtfsDriverPath, MAX_PATH_LEN, gEcConfig.AppDir, L"ntfs.efi");
     return;
   }
 
-  ConfigCopyPath(RawPath, MAX_PATH_LEN, gEcConfig.NtfsDriverPath);
+  ConfigCopyPath(RawPath, MAX_PATH_LEN, gEcConfig.NtfsDriverSetting);
   if (ConfigPathStartsWithSlash(RawPath)) {
     ConfigCopyPath(gEcConfig.NtfsDriverPath, MAX_PATH_LEN, RawPath);
     ConfigTrimLeadingSlash(gEcConfig.NtfsDriverPath);
@@ -226,6 +229,8 @@ static VOID ApplyKeyValue(IN CONST CHAR8* Key, IN UINTN KeyLen, IN CONST CHAR8* 
     gEcConfig.ShowSuccessMessages = ParseBool(Value, ValueLen, gEcConfig.ShowSuccessMessages);
   } else if (KeyLen == 20 && AsciiEqNoCase(Key, "ShowOperationSummary", 20)) {
     gEcConfig.ShowOperationSummary = ParseBool(Value, ValueLen, gEcConfig.ShowOperationSummary);
+  } else if (KeyLen == 15 && AsciiEqNoCase(Key, "VerifyAfterCopy", 15)) {
+    gEcConfig.VerifyAfterCopy = ParseBool(Value, ValueLen, gEcConfig.VerifyAfterCopy);
   } else if (KeyLen == 11 && AsciiEqNoCase(Key, "DefaultLeft", 11)) {
     ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.DefaultLeft, MAX_PATH_LEN);
   } else if (KeyLen == 12 && AsciiEqNoCase(Key, "DefaultRight", 12)) {
@@ -235,9 +240,9 @@ static VOID ApplyKeyValue(IN CONST CHAR8* Key, IN UINTN KeyLen, IN CONST CHAR8* 
   } else if (KeyLen == 11 && AsciiEqNoCase(Key, "FilterRight", 11)) {
     ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.FilterRight, 128);
   } else if (KeyLen == 14 && AsciiEqNoCase(Key, "NtfsDriverPath", 14)) {
-    ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.NtfsDriverPath, MAX_PATH_LEN);
+    ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.NtfsDriverSetting, MAX_PATH_LEN);
   } else if (KeyLen == 10 && AsciiEqNoCase(Key, "NtfsDriver", 10)) {
-    ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.NtfsDriverPath, MAX_PATH_LEN);
+    ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.NtfsDriverSetting, MAX_PATH_LEN);
   } else if (KeyLen == 7 && AsciiEqNoCase(Key, "HotDir", 6) && Key[6] >= '1' && Key[6] <= '9') {
     UINTN Index = (UINTN)(Key[6] - '1');
     ConfigAsciiToUnicode(Value, ValueLen, gEcConfig.HotDirs[Index], MAX_PATH_LEN);
@@ -286,6 +291,8 @@ VOID ConfigLoad(IN EFI_HANDLE ImageHandle)
   CHAR16 IniPath[MAX_PATH_LEN];
 
   ConfigSetDefaults();
+  gConfigDeviceHandle = NULL;
+  gConfigIniPath[0] = L'\0';
 
   Status = gBS->OpenProtocol(
     ImageHandle,
@@ -297,6 +304,7 @@ VOID ConfigLoad(IN EFI_HANDLE ImageHandle)
   );
   if (EFI_ERROR(Status) || LoadedImage == NULL) return;
   ConfigSetAppDir(LoadedImage);
+  gConfigDeviceHandle = LoadedImage->DeviceHandle;
 
   Status = gBS->HandleProtocol(LoadedImage->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, (VOID**)&Sfs);
   if (EFI_ERROR(Status) || Sfs == NULL) return;
@@ -305,12 +313,15 @@ VOID ConfigLoad(IN EFI_HANDLE ImageHandle)
   if (EFI_ERROR(Status) || Root == NULL) return;
 
   ConfigJoinPath(IniPath, MAX_PATH_LEN, gEcConfig.AppDir, L"EC.ini");
+  ConfigCopyPath(gConfigIniPath, MAX_PATH_LEN, IniPath);
   Status = ConfigOpenFromRoot(Root, IniPath, &File);
   if (EFI_ERROR(Status) && gEcConfig.AppDir[0] != L'\0') {
     Status = ConfigOpenFromRoot(Root, L"EC.ini", &File);
+    if (!EFI_ERROR(Status)) ConfigCopyPath(gConfigIniPath, MAX_PATH_LEN, L"EC.ini");
   }
   if (EFI_ERROR(Status) && StrCmp(gEcConfig.AppDir, L"EFI\\BOOT") != 0) {
     Status = ConfigOpenFromRoot(Root, L"EFI\\BOOT\\EC.ini", &File);
+    if (!EFI_ERROR(Status)) ConfigCopyPath(gConfigIniPath, MAX_PATH_LEN, L"EFI\\BOOT\\EC.ini");
   }
   Root->Close(Root);
   if (EFI_ERROR(Status) || File == NULL) {
@@ -343,4 +354,157 @@ VOID ConfigLoad(IN EFI_HANDLE ImageHandle)
   File->Close(File);
 
   ConfigResolveNtfsDriverPath();
+}
+
+#define CONFIG_SAVE_CAPACITY 32768
+
+static BOOLEAN ConfigAppendAscii(
+  IN OUT CHAR8* Buffer,
+  IN UINTN Capacity,
+  IN OUT UINTN* Position,
+  IN CONST CHAR8* Text
+) {
+  UINTN Pos;
+
+  if (Buffer == NULL || Position == NULL || Text == NULL) return FALSE;
+  Pos = *Position;
+  while (*Text != '\0') {
+    if (Pos + 1 >= Capacity) return FALSE;
+    Buffer[Pos++] = *Text++;
+  }
+  Buffer[Pos] = '\0';
+  *Position = Pos;
+  return TRUE;
+}
+
+static BOOLEAN ConfigAppendUnicode(
+  IN OUT CHAR8* Buffer,
+  IN UINTN Capacity,
+  IN OUT UINTN* Position,
+  IN CONST CHAR16* Text
+) {
+  UINTN Pos;
+
+  if (Buffer == NULL || Position == NULL || Text == NULL) return FALSE;
+  Pos = *Position;
+  while (*Text != L'\0') {
+    if (Pos + 1 >= Capacity) return FALSE;
+    // EC paths and masks are firmware-facing and normally ASCII. Keep the INI
+    // valid even if a firmware input method supplies a wider character.
+    Buffer[Pos++] = (*Text <= 0x7f) ? (CHAR8)*Text : '?';
+    Text++;
+  }
+  Buffer[Pos] = '\0';
+  *Position = Pos;
+  return TRUE;
+}
+
+static BOOLEAN ConfigAppendValue(
+  IN OUT CHAR8* Buffer,
+  IN UINTN Capacity,
+  IN OUT UINTN* Position,
+  IN CONST CHAR8* Key,
+  IN CONST CHAR16* Value
+) {
+  return ConfigAppendAscii(Buffer, Capacity, Position, Key) &&
+         ConfigAppendAscii(Buffer, Capacity, Position, "=") &&
+         ConfigAppendUnicode(Buffer, Capacity, Position, Value) &&
+         ConfigAppendAscii(Buffer, Capacity, Position, "\r\n");
+}
+
+EFI_STATUS ConfigSave(VOID)
+{
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* Sfs = NULL;
+  EFI_FILE_PROTOCOL* Root = NULL;
+  EFI_FILE_PROTOCOL* File = NULL;
+  EFI_FILE_INFO* Info = NULL;
+  EFI_GUID FileInfoGuid = EFI_FILE_INFO_ID;
+  EFI_STATUS Status;
+  CHAR8* Buffer;
+  UINTN Position = 0;
+  UINTN InfoSize = 0;
+  UINTN WriteSize;
+  CHAR8 HotDirKey[] = "HotDir1";
+
+  if (gConfigDeviceHandle == NULL || gConfigIniPath[0] == L'\0') return EFI_NOT_READY;
+
+  Buffer = AllocateZeroPool(CONFIG_SAVE_CAPACITY);
+  if (Buffer == NULL) return EFI_OUT_OF_RESOURCES;
+
+  if (!ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+        "; EC.ini - saved by the EC F9 settings menu.\r\n"
+        "; Values: 0/1. Paths use UEFI volume names such as fs0:\\\r\n\r\n") ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+        gEcConfig.ConfirmDelete ? "ConfirmDelete=1\r\n" : "ConfirmDelete=0\r\n") ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+        gEcConfig.ConfirmOverwrite ? "ConfirmOverwrite=1\r\n" : "ConfirmOverwrite=0\r\n") ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+        gEcConfig.ShowSuccessMessages ? "ShowSuccessMessages=1\r\n" : "ShowSuccessMessages=0\r\n") ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+        gEcConfig.ShowOperationSummary ? "ShowOperationSummary=1\r\n" : "ShowOperationSummary=0\r\n") ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+        gEcConfig.VerifyAfterCopy ? "VerifyAfterCopy=1\r\n\r\n" : "VerifyAfterCopy=0\r\n\r\n") ||
+      !ConfigAppendValue(Buffer, CONFIG_SAVE_CAPACITY, &Position, "NtfsDriverPath", gEcConfig.NtfsDriverSetting) ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position, "\r\n") ||
+      !ConfigAppendValue(Buffer, CONFIG_SAVE_CAPACITY, &Position, "DefaultLeft", gEcConfig.DefaultLeft) ||
+      !ConfigAppendValue(Buffer, CONFIG_SAVE_CAPACITY, &Position, "DefaultRight", gEcConfig.DefaultRight) ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position, "\r\n") ||
+      !ConfigAppendValue(Buffer, CONFIG_SAVE_CAPACITY, &Position, "FilterLeft", gEcConfig.FilterLeft) ||
+      !ConfigAppendValue(Buffer, CONFIG_SAVE_CAPACITY, &Position, "FilterRight", gEcConfig.FilterRight) ||
+      !ConfigAppendAscii(Buffer, CONFIG_SAVE_CAPACITY, &Position, "\r\n")) {
+    FreePool(Buffer);
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  for (UINTN Index = 0; Index < EC_MAX_HOTDIRS; Index++) {
+    HotDirKey[6] = (CHAR8)('1' + Index);
+    if (!ConfigAppendValue(Buffer, CONFIG_SAVE_CAPACITY, &Position,
+                           HotDirKey, gEcConfig.HotDirs[Index])) {
+      FreePool(Buffer);
+      return EFI_BUFFER_TOO_SMALL;
+    }
+  }
+
+  Status = gBS->HandleProtocol(gConfigDeviceHandle, &gEfiSimpleFileSystemProtocolGuid, (VOID**)&Sfs);
+  if (EFI_ERROR(Status) || Sfs == NULL) {
+    FreePool(Buffer);
+    return EFI_ERROR(Status) ? Status : EFI_NOT_FOUND;
+  }
+
+  Status = Sfs->OpenVolume(Sfs, &Root);
+  if (EFI_ERROR(Status) || Root == NULL) {
+    FreePool(Buffer);
+    return EFI_ERROR(Status) ? Status : EFI_NOT_FOUND;
+  }
+
+  Status = Root->Open(Root, &File, gConfigIniPath,
+                      EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+  if (EFI_ERROR(Status) || File == NULL) {
+    Root->Close(Root);
+    FreePool(Buffer);
+    return EFI_ERROR(Status) ? Status : EFI_NOT_FOUND;
+  }
+
+  Status = File->GetInfo(File, &FileInfoGuid, &InfoSize, NULL);
+  if (Status == EFI_BUFFER_TOO_SMALL) {
+    Info = AllocatePool(InfoSize);
+    if (Info == NULL) Status = EFI_OUT_OF_RESOURCES;
+    else Status = File->GetInfo(File, &FileInfoGuid, &InfoSize, Info);
+  }
+  if (!EFI_ERROR(Status) && Info != NULL) {
+    Info->FileSize = 0;
+    Status = File->SetInfo(File, &FileInfoGuid, InfoSize, Info);
+  }
+  if (Info != NULL) FreePool(Info);
+
+  if (!EFI_ERROR(Status)) Status = File->SetPosition(File, 0);
+  WriteSize = Position;
+  if (!EFI_ERROR(Status)) Status = File->Write(File, &WriteSize, Buffer);
+  if (!EFI_ERROR(Status) && WriteSize != Position) Status = EFI_DEVICE_ERROR;
+  if (!EFI_ERROR(Status)) Status = File->Flush(File);
+
+  File->Close(File);
+  Root->Close(Root);
+  FreePool(Buffer);
+  return Status;
 }

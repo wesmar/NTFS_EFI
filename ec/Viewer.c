@@ -1,5 +1,6 @@
 // Viewer.c — modal ASCII and HEX file viewer implementation
 #include "Viewer.h"
+#include "Colors.h"
 #include "UiConsole.h"
 #include "FileSystem.h"
 #include "Gui.h"
@@ -9,30 +10,6 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/PrintLib.h>
-
-#define COLOR_BLUE_R 0
-#define COLOR_BLUE_G 0
-#define COLOR_BLUE_B 170
-
-#define COLOR_YELLOW_R 255
-#define COLOR_YELLOW_G 255
-#define COLOR_YELLOW_B 85
-
-#define COLOR_WHITE_R 255
-#define COLOR_WHITE_G 255
-#define COLOR_WHITE_B 255
-
-#define COLOR_CYAN_R 85
-#define COLOR_CYAN_G 255
-#define COLOR_CYAN_B 255
-
-#define COLOR_GRAY_R 170
-#define COLOR_GRAY_G 170
-#define COLOR_GRAY_B 170
-
-#define COLOR_BLACK_R 0
-#define COLOR_BLACK_G 0
-#define COLOR_BLACK_B 0
 
 typedef enum {
   VIEW_MODE_TEXT,
@@ -228,6 +205,95 @@ static BOOLEAN DetectIsBinary(UINT8* Buffer, UINT64 FileSize)
   return FALSE;
 }
 
+/*
+ * Finding a string in the open file. What the viewer is for in a rescue is
+ * reading a log or a hive dump, and both are answered by "where does this word
+ * appear", not by scrolling.
+ *
+ * The needle is typed as text and matched case-insensitively against the raw
+ * bytes, which covers ASCII in a text file and ASCII embedded in a binary -
+ * the two cases a pre-boot viewer actually meets. The file is already in
+ * memory, so the search is a plain scan with no allocation and no index.
+ */
+static UINT8 ViewerUpper(UINT8 Ch)
+{
+  return (Ch >= 'a' && Ch <= 'z') ? (UINT8)(Ch - ('a' - 'A')) : Ch;
+}
+
+// Returns TRUE and the offset of the first match at or after From.
+BOOLEAN ViewerFindBytes(
+  IN  CONST UINT8* Data,
+  IN  UINT64 Size,
+  IN  CONST UINT8* Needle,
+  IN  UINTN NeedleLen,
+  IN  UINT64 From,
+  OUT UINT64* Found
+) {
+  UINT64 i;
+
+  if (Data == NULL || Needle == NULL || NeedleLen == 0 || NeedleLen > Size) return FALSE;
+
+  for (i = From; i + NeedleLen <= Size; i++) {
+    UINTN j = 0;
+    while (j < NeedleLen && ViewerUpper(Data[i + j]) == ViewerUpper(Needle[j])) {
+      j++;
+    }
+    if (j == NeedleLen) {
+      *Found = i;
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+// The typed needle is UCS-2; the file is bytes. Narrow it, refusing anything
+// that is not plain ASCII rather than truncating it into a wrong match.
+BOOLEAN ViewerNeedleToBytes(
+  IN  CONST CHAR16* Text,
+  OUT UINT8* Bytes,
+  IN  UINTN MaxBytes,
+  OUT UINTN* Length
+) {
+  UINTN n = 0;
+
+  while (Text[n] != L'\0') {
+    if (n >= MaxBytes || Text[n] > 0x7F) return FALSE;
+    Bytes[n] = (UINT8)Text[n];
+    n++;
+  }
+  *Length = n;
+  return (BOOLEAN)(n > 0);
+}
+
+// Put the byte at Offset on screen, in whichever mode is showing: the hex view
+// scrolls to its 16-byte row, the text view to the line the byte falls in.
+static VOID ViewerGoToOffset(
+  IN  UINT64 Offset,
+  IN  VIEWER_MODE Mode,
+  OUT UINTN* TextTopLine,
+  OUT UINT64* HexTopOffset,
+  IN  VOID* FileBuffer
+) {
+  if (Mode == VIEW_MODE_HEX) {
+    *HexTopOffset = (Offset / 16) * 16;
+    return;
+  }
+  if (gTextLines == NULL || gTextLineCount == 0) {
+    *TextTopLine = 0;
+    return;
+  }
+  {
+    UINTN i;
+    UINTN best = 0;
+    for (i = 0; i < gTextLineCount; i++) {
+      UINT64 lineOffset = (UINT64)(gTextLines[i].Data - (UINT8*)FileBuffer);
+      if (lineOffset > Offset) break;
+      best = i;
+    }
+    *TextTopLine = best;
+  }
+}
+
 VOID ViewerShow(
   IN EFI_HANDLE ImageHandle,
   IN CONST CHAR16* Path
@@ -259,6 +325,10 @@ VOID ViewerShow(
   // Scrolling metrics
   UINTN textTopLine = 0;
   UINT64 hexTopOffset = 0;
+  CHAR16 findText[128] = { 0 };
+  UINT8 findBytes[128];
+  UINTN findLen = 0;
+  UINT64 findFrom = 0;
 
   BOOLEAN quit = FALSE;
   while (!quit) {
@@ -355,7 +425,7 @@ VOID ViewerShow(
     UiGfxFillRectRgb(0, footerY, width, footerH, COLOR_BLACK_R, COLOR_BLACK_G, COLOR_BLACK_B);
     DrawAsciiAtScale(
       15, footerY + 3,
-      "[ F4: Toggle Mode (Text/Hex) ]    [ Esc: Close ]    [ Arrows/PgUp/PgDn: Scroll ]",
+      "[ F4: Text/Hex ]  [ F7: Find ]  [ F3 or N: Next ]  [ Esc: Close ]  [ Arrows/PgUp/PgDn ]",
       COLOR_CYAN_R, COLOR_CYAN_G, COLOR_CYAN_B,
       viewerScale
     );
@@ -451,6 +521,42 @@ VOID ViewerShow(
           }
           break;
 
+        case SCAN_F7: {
+          CHAR16 prompt[128];
+          StrCpyS(prompt, ARRAY_SIZE(prompt), findText);
+          if (GuiDrawInputBox(L"Find", L"Text to look for:", prompt, ARRAY_SIZE(prompt))) {
+            UINTN len = 0;
+            if (!ViewerNeedleToBytes(prompt, findBytes, sizeof(findBytes), &len)) {
+              GuiDrawMsgBox(L"Find", L"Type plain ASCII text to look for.");
+            } else {
+              UINT64 hit = 0;
+              StrCpyS(findText, ARRAY_SIZE(findText), prompt);
+              findLen = len;
+              if (ViewerFindBytes((UINT8*)fileBuffer, fileSize, findBytes, findLen, 0, &hit)) {
+                findFrom = hit + 1;
+                ViewerGoToOffset(hit, mode, &textTopLine, &hexTopOffset, fileBuffer);
+              } else {
+                GuiDrawMsgBox(L"Find", L"Not found.");
+              }
+            }
+          }
+          break;
+        }
+
+        case SCAN_F3: {
+          // find next, from just past the previous hit
+          UINT64 hit = 0;
+          if (findLen == 0) break;
+          if (ViewerFindBytes((UINT8*)fileBuffer, fileSize, findBytes, findLen, findFrom, &hit)) {
+            findFrom = hit + 1;
+            ViewerGoToOffset(hit, mode, &textTopLine, &hexTopOffset, fileBuffer);
+          } else {
+            GuiDrawMsgBox(L"Find", L"No further match; searching from the top again.");
+            findFrom = 0;
+          }
+          break;
+        }
+
         case SCAN_ESC:
           quit = TRUE;
           break;
@@ -477,6 +583,17 @@ VOID ViewerShow(
                 break;
               }
             }
+          }
+        }
+      } else if (key.UnicodeChar == L'n' || key.UnicodeChar == L'N') {
+        UINT64 hit = 0;
+        if (findLen != 0) {
+          if (ViewerFindBytes((UINT8*)fileBuffer, fileSize, findBytes, findLen, findFrom, &hit)) {
+            findFrom = hit + 1;
+            ViewerGoToOffset(hit, mode, &textTopLine, &hexTopOffset, fileBuffer);
+          } else {
+            GuiDrawMsgBox(L"Find", L"No further match; searching from the top again.");
+            findFrom = 0;
           }
         }
       } else if (key.UnicodeChar == 27) { // ESC char

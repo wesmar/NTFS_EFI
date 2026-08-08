@@ -89,7 +89,7 @@ BOOLEAN NavShowHotlist(IN OUT PANEL* Panel, IN OUT NAV_HISTORY* History)
 
   UiGfxGetDimensions(&width, &height);
   UiGfxGetCellSize(&cellW, &cellH);
-  boxW = width > 900 ? 760 : width - 80;
+  boxW = GuiDialogWidth(760);
   boxH = cellH * (gEcConfig.HotDirCount + 5);
   boxX = (width - boxW) / 2;
   boxY = (height - boxH) / 2;

@@ -2,14 +2,19 @@
 # Wynik: bin\ntfs.efi, bin\EC.efi, bin\ntfs_probe.efi
 # Archiwum release tworzy pack-data.sh (data\NTFS_EFI.7z).
 #
-#   .\build.ps1          # build produkcyjny
-#   .\build.ps1 -Diag    # diagnostyczne kody odmowy (NTFS_DIAG_STATUS=1)
+#   .\build.ps1            # build produkcyjny
+#   .\build.ps1 -Diag      # diagnostyczne kody odmowy (NTFS_DIAG_STATUS=1)
+#   .\build.ps1 -SelfTest  # EC z wkompilowana sciezka testu (EC_SELFTEST=1)
 #
 # -Diag sluzy WYLACZNIE do namierzenia, ktore ograniczenie odmowilo: kazde
 # miejsce NTFS_REFUSE zwraca wtedy wlasny status zamiast jednego
 # EFI_UNSUPPORTED, ktory widzi aplikacja. Bez tego przelacznika argument znika
 # w preprocesorze, wiec build produkcyjny nie nosi po nim zadnego sladu.
-param([switch]$Diag)
+#
+# -SelfTest dotyczy wylacznie EC: wlacza EC_SELFTEST, przez co SelfTest.c w
+# ogole trafia do binarki. Bez tego przelacznika plik kompiluje sie do niczego,
+# wiec wersja produkcyjna nie zawiera ani kodu testu, ani sprawdzania flagi.
+param([switch]$Diag, [switch]$SelfTest)
 $ErrorActionPreference = "Stop"
 
 Write-Host "========================================================" -ForegroundColor Cyan
@@ -50,7 +55,9 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Kompilacja ntfs.vcxproj nie powiodła si
 # 4. Kompilacja projektu EC (EC.efi)
 Write-Host "[+] Kompilacja EC.vcxproj (Release)..." -ForegroundColor Yellow
 $ecVcxproj = Join-Path $PSScriptRoot "ec\EC.vcxproj"
-& $msBuildPath $ecVcxproj /p:Configuration=$config /p:Platform=$platform /t:Rebuild /m /nologo
+$selfTestArg = if ($SelfTest) { '/p:EcSelfTest=1' } else { '/p:EcSelfTest=0' }
+if ($SelfTest) { Write-Host "    build SELF-TEST: sciezka testu jest wkompilowana w EC.efi" -ForegroundColor Yellow }
+& $msBuildPath $ecVcxproj /p:Configuration=$config /p:Platform=$platform $selfTestArg /t:Rebuild /m /nologo
 if ($LASTEXITCODE -ne 0) { Write-Error "Kompilacja EC.vcxproj nie powiodła się." }
 
 # 5. Kompilacja projektu probe (ntfs_probe.efi)

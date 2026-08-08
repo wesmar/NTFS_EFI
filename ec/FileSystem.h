@@ -33,6 +33,16 @@ EFI_STATUS FsGetVolumeInfo(
   IN UINTN LabelSize
 );
 
+EFI_STATUS FsGetVolumeDetails(
+  IN FS_VOLUME* Vol,
+  OUT UINT64* TotalSize,
+  OUT UINT64* FreeSize,
+  OUT UINT32* BlockSize,
+  OUT BOOLEAN* ReadOnly,
+  OUT CHAR16* Label,
+  IN UINTN LabelSize
+);
+
 // Initializes and refreshes the volume list
 VOID FsInit(VOID);
 
@@ -66,6 +76,16 @@ EFI_STATUS FsReadFileToBuffer(
   OUT UINT64* Size
 );
 
+// Reads at most Capacity bytes without allocating the whole file. Used by the
+// passive-panel quick view for large files.
+EFI_STATUS FsReadFilePrefix(
+  IN CONST CHAR16* Path,
+  OUT VOID* Buffer,
+  IN UINTN Capacity,
+  OUT UINTN* BytesRead,
+  OUT UINT64* TotalSize
+);
+
 // Tries to find and load ntfs.efi
 EFI_STATUS FsLoadNtfsDriver(IN EFI_HANDLE ImageHandle);
 
@@ -75,6 +95,15 @@ VOID FsUnmountAllNtfs(VOID);
 
 // Runs another EFI program
 EFI_STATUS FsStartEfiApp(IN EFI_HANDLE ImageHandle, IN CONST CHAR16* Path);
+EFI_STATUS FsStartEfiAppWithArgs(
+  IN EFI_HANDLE ImageHandle,
+  IN CONST CHAR16* Path,
+  IN CONST CHAR16* Arguments
+);
+
+// Starts a selected EFI image as a driver, reconnects controllers and rescans.
+EFI_STATUS FsStartEfiDriver(IN EFI_HANDLE ImageHandle, IN CONST CHAR16* Path);
+VOID FsRescanDevices(VOID);
 
 // Finds the path to Windows Boot Manager on any mounted volume
 CHAR16* FsFindWindowsBootManager(VOID);
@@ -104,6 +133,28 @@ EFI_STATUS FsDeleteRecursive(IN CONST CHAR16* Path);
 // Forces the volume that Path lives on to flush buffered writes to the medium
 // (durability for delete/rename/mkdir, which leave no file handle to Flush()).
 EFI_STATUS FsFlushVolumeForPath(IN CONST CHAR16* Path);
+
+// Reads the DOS attributes and the three timestamps of a file or directory.
+EFI_STATUS FsGetFileMeta(
+  IN  CONST CHAR16* Path,
+  OUT UINT64* Attributes,
+  OUT EFI_TIME* CreateTime,
+  OUT EFI_TIME* ModificationTime,
+  OUT EFI_TIME* LastAccessTime
+);
+
+// Writes DOS attributes and/or the modification time back. A NULL pointer
+// leaves that part of the file's metadata alone, so clearing ReadOnly does not
+// disturb the timestamps and setting a date does not disturb the attributes.
+EFI_STATUS FsSetFileMeta(
+  IN CONST CHAR16* Path,
+  IN CONST UINT64* Attributes,
+  IN CONST EFI_TIME* ModificationTime
+);
+
+// The volume a path belongs to, or NULL when the path names none. Several
+// places had their own copy of this loop.
+FS_VOLUME* FsFindVolumeForPath(IN CONST CHAR16* Path);
 
 // Renames or moves a file or directory within the same volume
 EFI_STATUS FsRenameOrMove(IN CONST CHAR16* SrcPath, IN CONST CHAR16* DstPath);

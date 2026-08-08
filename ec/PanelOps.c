@@ -11,6 +11,70 @@ static CHAR16 UpCaseChar(CHAR16 Ch)
   return Ch;
 }
 
+// Same instant, to the second. Sub-second fields and the time zone are left
+// out on purpose: FAT keeps two-second resolution and an unset zone, so
+// comparing them would report every FAT-to-NTFS pair as different.
+static BOOLEAN PanelOpsSameTime(IN CONST EFI_TIME* A, IN CONST EFI_TIME* B)
+{
+  return (BOOLEAN)(A->Year == B->Year && A->Month == B->Month && A->Day == B->Day &&
+                   A->Hour == B->Hour && A->Minute == B->Minute && A->Second == B->Second);
+}
+
+// The counterpart of Item on the other side, by name, or NULL.
+static CONST FS_FILE_ITEM* PanelOpsFindByName(
+  IN CONST PANEL* Panel,
+  IN CONST CHAR16* Name
+) {
+  UINTN i;
+
+  if (Panel == NULL || Panel->Files == NULL) return NULL;
+  for (i = 0; i < Panel->FileCount; i++) {
+    if (StrCmp(Panel->Files[i].Name, Name) == 0) {
+      return &Panel->Files[i];
+    }
+  }
+  return NULL;
+}
+
+static BOOLEAN PanelOpsDiffers(IN CONST FS_FILE_ITEM* A, IN CONST FS_FILE_ITEM* B)
+{
+  if (B == NULL) return TRUE;                       /* not on the other side  */
+  if (A->IsDirectory != B->IsDirectory) return TRUE; /* file against folder   */
+  if (A->IsDirectory) return FALSE;                  /* presence is the test  */
+  if (A->Size != B->Size) return TRUE;
+  return (BOOLEAN)(!PanelOpsSameTime(&A->ModificationTime, &B->ModificationTime));
+}
+
+static UINTN PanelOpsMarkAgainst(IN OUT PANEL* Panel, IN CONST PANEL* Other)
+{
+  UINTN marked = 0;
+  UINTN i;
+
+  if (Panel == NULL || Panel->Files == NULL) return 0;
+
+  for (i = 0; i < Panel->FileCount; i++) {
+    FS_FILE_ITEM* item = &Panel->Files[i];
+
+    item->Selected = FALSE;
+    if (!PanelOpsIsUsableItem(item)) continue;
+    if (PanelOpsDiffers(item, PanelOpsFindByName(Other, item->Name))) {
+      item->Selected = TRUE;
+      marked++;
+    }
+  }
+  return marked;
+}
+
+UINTN PanelOpsCompareSelect(IN OUT PANEL* Left, IN OUT PANEL* Right)
+{
+  UINTN marked = 0;
+
+  if (Left == NULL || Right == NULL) return 0;
+  marked += PanelOpsMarkAgainst(Left, Right);
+  marked += PanelOpsMarkAgainst(Right, Left);
+  return marked;
+}
+
 BOOLEAN PanelOpsIsUsableItem(IN CONST FS_FILE_ITEM* Item)
 {
   return Item != NULL && StrCmp(Item->Name, L"..") != 0;

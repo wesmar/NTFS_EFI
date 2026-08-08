@@ -263,20 +263,26 @@ static BOOLEAN DrawCopyrightGlyph(UINTN x, UINTN y, UINT32 color, UINTN scaleX, 
 static UINT32 FallbackGlyph(UINT32 codepoint);
 static CONST CHAR8* FallbackText(UINT32 codepoint);
 
-static BOOLEAN GfxDrawGlyphScaledXY(UINT32 codepoint, UINTN x, UINTN y,
-                                    UINT32 color, UINTN scaleX, UINTN scaleY)
+static BOOLEAN GfxDrawGlyphScaledRatioXY(UINT32 codepoint, UINTN x, UINTN y,
+                                         UINT32 color,
+                                         UINTN scaleXNum, UINTN scaleXDen,
+                                         UINTN scaleYNum, UINTN scaleYDen)
 {
   if (!gGfxReady || !gBackBuffer || x >= gFbWidth || y >= gFbHeight) {
     return FALSE;
   }
 
-  if (scaleX == 0) scaleX = 1;
-  if (scaleY == 0) scaleY = 1;
+  if (scaleXNum == 0) scaleXNum = 1;
+  if (scaleXDen == 0) scaleXDen = 1;
+  if (scaleYNum == 0) scaleYNum = 1;
+  if (scaleYDen == 0) scaleYDen = 1;
 
   unsigned char* chr = FindGlyph(codepoint);
   if (!chr) {
     if (codepoint == 0x00A9) {
-      return DrawCopyrightGlyph(x, y, color, scaleX, scaleY);
+      return DrawCopyrightGlyph(x, y, color,
+                                (scaleXNum + scaleXDen - 1) / scaleXDen,
+                                (scaleYNum + scaleYDen - 1) / scaleYDen);
     }
     UINT32 fallback = FallbackGlyph(codepoint);
     if (fallback) {
@@ -312,16 +318,28 @@ static BOOLEAN GfxDrawGlyphScaledXY(UINT32 codepoint, UINTN x, UINTN y,
     for (m = 1; j; j--, n++) {
       for (l = 0; l < k; l++, m <<= 1) {
         if (m > 0x80) { frg++; m = 1; }
-        if (*frg & m) {
-          GfxFillRect(x + (UINTN)l * scaleX,
-                      y + (UINTN)n * scaleY,
-                      scaleX, scaleY, color);
+        if ((*frg & m) && n >= 0) {
+          UINTN left = (UINTN)l * scaleXNum / scaleXDen;
+          UINTN right = ((UINTN)l + 1) * scaleXNum / scaleXDen;
+          UINTN top = (UINTN)n * scaleYNum / scaleYDen;
+          UINTN bottom = ((UINTN)n + 1) * scaleYNum / scaleYDen;
+          if (right <= left) right = left + 1;
+          if (bottom <= top) bottom = top + 1;
+          GfxFillRect(x + left, y + top, right - left, bottom - top, color);
         }
       }
     }
   }
 
   return TRUE;
+}
+
+static BOOLEAN GfxDrawGlyphScaledXY(UINT32 codepoint, UINTN x, UINTN y,
+                                    UINT32 color, UINTN scaleX, UINTN scaleY)
+{
+  return GfxDrawGlyphScaledRatioXY(codepoint, x, y, color,
+                                   scaleX == 0 ? 1 : scaleX, 1,
+                                   scaleY == 0 ? 1 : scaleY, 1);
 }
 
 static UINT32 FallbackGlyph(UINT32 codepoint)
@@ -748,6 +766,14 @@ VOID UiGfxDrawGlyphScaled(UINT32 codepoint, UINTN x, UINTN y,
                            UINT8 r, UINT8 g, UINT8 b, UINTN scale)
 {
   GfxDrawGlyphScaledXY(codepoint, x, y, MakeColor(r, g, b), scale == 0 ? 1 : scale, scale == 0 ? 1 : scale);
+}
+
+VOID UiGfxDrawGlyphScaledRatio(UINT32 codepoint, UINTN x, UINTN y,
+                               UINT8 r, UINT8 g, UINT8 b,
+                               UINTN numerator, UINTN denominator)
+{
+  GfxDrawGlyphScaledRatioXY(codepoint, x, y, MakeColor(r, g, b),
+                            numerator, denominator, numerator, denominator);
 }
 
 VOID UiGfxGetCursor(OUT UINTN* Col, OUT UINTN* Row)

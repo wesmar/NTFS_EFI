@@ -19,6 +19,8 @@ VOID    UiGfxSetCursor(UINTN Col, UINTN Row);
 VOID    UiGfxFillRectRgb(UINTN x, UINTN y, UINTN w, UINTN h, UINT8 r, UINT8 g, UINT8 b);
 VOID    UiGfxSetPixel(UINTN x, UINTN y, UINT8 r, UINT8 g, UINT8 b);
 VOID    UiGfxDrawGlyphScaled(UINT32 codepoint, UINTN x, UINTN y, UINT8 r, UINT8 g, UINT8 b, UINTN scale);
+VOID    UiGfxDrawGlyphScaledRatio(UINT32 codepoint, UINTN x, UINTN y, UINT8 r, UINT8 g, UINT8 b,
+                                  UINTN numerator, UINTN denominator);
 VOID    UiGfxGetCursor(OUT UINTN* Col, OUT UINTN* Row);
 VOID    UiGfxDrawAsciiAt(UINTN x, UINTN y, CONST CHAR8* str, UINT8 r, UINT8 g, UINT8 b);
 VOID    UiGfxDrawUnicodeAt(UINTN x, UINTN y, CONST CHAR16* str, UINT8 r, UINT8 g, UINT8 b);

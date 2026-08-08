@@ -20,6 +20,17 @@ typedef struct {
   UINTN TopIndex;     // Scroll offset (index of the file drawn at the top of the panel)
   PANEL_SORT_MODE SortMode;
   BOOLEAN SortDescending;
+
+  /*
+   * Volume figures for the status line, read when the listing is read rather
+   * than on every frame. The footer used to ask the volume for its free space
+   * on each redraw, which is once per keystroke per panel - two round trips
+   * through the file system driver to print a number that only changes when
+   * something is written, and every write path refreshes the panel anyway.
+   */
+  UINT64 VolumeTotal;
+  UINT64 VolumeFree;
+  CHAR16 VolumeLabel[32];
 } PANEL;
 
 // Initializes a panel with a default path

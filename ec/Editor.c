@@ -1,5 +1,6 @@
 // Editor.c — Modal Hex and Text Editor.
 #include "Editor.h"
+#include "Colors.h"
 #include "UiConsole.h"
 #include "FileSystem.h"
 #include "Gui.h"
@@ -9,34 +10,6 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/PrintLib.h>
-
-#define COLOR_BLUE_R 0
-#define COLOR_BLUE_G 0
-#define COLOR_BLUE_B 170
-
-#define COLOR_YELLOW_R 255
-#define COLOR_YELLOW_G 255
-#define COLOR_YELLOW_B 85
-
-#define COLOR_WHITE_R 255
-#define COLOR_WHITE_G 255
-#define COLOR_WHITE_B 255
-
-#define COLOR_CYAN_R 85
-#define COLOR_CYAN_G 255
-#define COLOR_CYAN_B 255
-
-#define COLOR_GRAY_R 170
-#define COLOR_GRAY_G 170
-#define COLOR_GRAY_B 170
-
-#define COLOR_BLACK_R 0
-#define COLOR_BLACK_G 0
-#define COLOR_BLACK_B 0
-
-#define COLOR_GREEN_R 0
-#define COLOR_GREEN_G 170
-#define COLOR_GREEN_B 0
 
 typedef enum {
   EDIT_MODE_TEXT,

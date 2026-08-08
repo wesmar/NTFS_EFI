@@ -188,6 +188,21 @@ EFI_STATUS PanelRefreshKeep(PANEL* Panel, IN CONST CHAR16* PreferredName, IN INT
   Panel->Files = NULL;
   Panel->FileCount = 0;
 
+  Panel->VolumeTotal = 0;
+  Panel->VolumeFree = 0;
+  Panel->VolumeLabel[0] = L'\0';
+  {
+    FS_VOLUME* vol = FsFindVolumeForPath(Panel->Path);
+    if (vol != NULL) {
+      if (EFI_ERROR(FsGetVolumeInfo(vol, &Panel->VolumeTotal, &Panel->VolumeFree,
+                                    Panel->VolumeLabel, ARRAY_SIZE(Panel->VolumeLabel)))) {
+        Panel->VolumeTotal = 0;
+        Panel->VolumeFree = 0;
+        Panel->VolumeLabel[0] = L'\0';
+      }
+    }
+  }
+
   EFI_STATUS status = FsListDirectory(Panel->Path, &Panel->Files, &Panel->FileCount);
   if (oldFiles != NULL) {
     FreePool(oldFiles);
@@ -356,6 +371,16 @@ VOID PanelEnter(PANEL* Panel, EFI_HANDLE ImageHandle)
           if (nameLen > 0 && nameLen < 256) {
             CopyMem(restoreName, &Panel->Path[i], nameLen * sizeof(CHAR16));
             restoreName[nameLen] = L'\0';
+          } else if (Panel->Path[i - 1] == L':' && len < 256) {
+            /*
+             * Leaving a volume root, not a directory. The separator is the last
+             * character, so there is no trailing name to go back to and the
+             * cursor was landing on the top of the drive list. The entry to
+             * return to is the volume itself - "fs2:" for "fs2:\" - which is
+             * where every other commander leaves it.
+             */
+            CopyMem(restoreName, Panel->Path, len * sizeof(CHAR16));
+            restoreName[len] = L'\0';
           }
           break;
         }

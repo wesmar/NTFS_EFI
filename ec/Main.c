@@ -8,6 +8,7 @@
 #include <Library/PrintLib.h>
 
 #include "UiConsole.h"
+#include "Colors.h"
 #include "FileSystem.h"
 #include "Panel.h"
 #include "Gui.h"
@@ -16,27 +17,13 @@
 #include "PanelOps.h"
 #include "Config.h"
 #include "Navigation.h"
+#include "Search.h"
+#include "FileProps.h"
+#include "SelfTest.h"
+#include "Checksum.h"
+#include "Sync.h"
+#include "UefiTools.h"
 #include <Protocol/SimpleTextInEx.h>
-
-#define COLOR_BLUE_R 0
-#define COLOR_BLUE_G 0
-#define COLOR_BLUE_B 170
-
-#define COLOR_YELLOW_R 255
-#define COLOR_YELLOW_G 255
-#define COLOR_YELLOW_B 85
-
-#define COLOR_WHITE_R 255
-#define COLOR_WHITE_G 255
-#define COLOR_WHITE_B 255
-
-#define COLOR_CYAN_R 85
-#define COLOR_CYAN_G 255
-#define COLOR_CYAN_B 255
-
-#define COLOR_BLACK_R 0
-#define COLOR_BLACK_G 0
-#define COLOR_BLACK_B 0
 
 EFI_GUID gEfiSimpleTextInputExProtocolGuid = EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
 
@@ -291,6 +278,531 @@ static VOID ShowDriveMenu(
   }
 }
 
+static BOOLEAN SaveConfigOrReport(VOID)
+{
+  EFI_STATUS Status = ConfigSave();
+  if (EFI_ERROR(Status)) {
+    CHAR16 Message[160];
+    UnicodeSPrint(Message, sizeof(Message), L"Could not save EC.ini: %r", Status);
+    GuiDrawMsgBox(L"Settings error", Message);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static VOID RecountHotDirectories(VOID)
+{
+  gEcConfig.HotDirCount = 0;
+  for (UINTN Index = 0; Index < EC_MAX_HOTDIRS; Index++) {
+    if (gEcConfig.HotDirs[Index][0] != L'\0') {
+      gEcConfig.HotDirCount = Index + 1;
+    }
+  }
+}
+
+static VOID ShowHotDirectorySettings(VOID)
+{
+  CHAR16 LineStorage[EC_MAX_HOTDIRS + 1][192];
+  CONST CHAR16* Lines[EC_MAX_HOTDIRS + 1];
+  UINTN Chosen = 0;
+
+  for (;;) {
+    for (UINTN Index = 0; Index < EC_MAX_HOTDIRS; Index++) {
+      CONST CHAR16* Value = gEcConfig.HotDirs[Index][0] != L'\0'
+                          ? gEcConfig.HotDirs[Index] : L"<empty>";
+      UnicodeSPrint(LineStorage[Index], sizeof(LineStorage[Index]),
+                    L"HotDir%d: %s", (UINT32)(Index + 1), Value);
+      Lines[Index] = LineStorage[Index];
+    }
+    StrCpyS(LineStorage[EC_MAX_HOTDIRS], 192, L"Back");
+    Lines[EC_MAX_HOTDIRS] = LineStorage[EC_MAX_HOTDIRS];
+
+    if (!GuiDrawListPicker(L"Hot directories - changes save immediately",
+                           Lines, EC_MAX_HOTDIRS + 1, &Chosen) ||
+        Chosen == EC_MAX_HOTDIRS) {
+      return;
+    }
+
+    {
+      CHAR16 Value[MAX_PATH_LEN];
+      StrCpyS(Value, MAX_PATH_LEN, gEcConfig.HotDirs[Chosen]);
+      if (GuiDrawInputBox(L"Hot directory", L"Path (empty removes entry):",
+                          Value, MAX_PATH_LEN)) {
+        StrCpyS(gEcConfig.HotDirs[Chosen], MAX_PATH_LEN, Value);
+        RecountHotDirectories();
+        SaveConfigOrReport();
+      }
+    }
+  }
+}
+
+static VOID ShowSettingsMenu(IN PANEL* LeftPanel, IN PANEL* RightPanel)
+{
+  enum { SETTINGS_LINE_COUNT = 13 };
+  CHAR16 LineStorage[SETTINGS_LINE_COUNT][192];
+  CONST CHAR16* Lines[SETTINGS_LINE_COUNT];
+  UINTN Chosen = 0;
+
+  for (;;) {
+    CONST CHAR16* DefaultLeft = gEcConfig.DefaultLeft[0] != L'\0'
+                              ? gEcConfig.DefaultLeft : L"<automatic>";
+    CONST CHAR16* DefaultRight = gEcConfig.DefaultRight[0] != L'\0'
+                               ? gEcConfig.DefaultRight : L"<automatic>";
+    CONST CHAR16* NtfsPath = gEcConfig.NtfsDriverSetting[0] != L'\0'
+                           ? gEcConfig.NtfsDriverSetting : L"<next to EC>";
+
+    UnicodeSPrint(LineStorage[0], sizeof(LineStorage[0]), L"Confirm delete: %s",
+                  gEcConfig.ConfirmDelete ? L"On" : L"Off");
+    UnicodeSPrint(LineStorage[1], sizeof(LineStorage[1]), L"Confirm overwrite: %s",
+                  gEcConfig.ConfirmOverwrite ? L"On" : L"Off");
+    UnicodeSPrint(LineStorage[2], sizeof(LineStorage[2]), L"Success messages: %s",
+                  gEcConfig.ShowSuccessMessages ? L"On" : L"Off");
+    UnicodeSPrint(LineStorage[3], sizeof(LineStorage[3]), L"Operation summary: %s",
+                  gEcConfig.ShowOperationSummary ? L"On" : L"Off");
+    UnicodeSPrint(LineStorage[4], sizeof(LineStorage[4]), L"Startup left: %s", DefaultLeft);
+    UnicodeSPrint(LineStorage[5], sizeof(LineStorage[5]), L"Startup right: %s", DefaultRight);
+    UnicodeSPrint(LineStorage[6], sizeof(LineStorage[6]), L"Left filter: %s", gEcConfig.FilterLeft);
+    UnicodeSPrint(LineStorage[7], sizeof(LineStorage[7]), L"Right filter: %s", gEcConfig.FilterRight);
+    UnicodeSPrint(LineStorage[8], sizeof(LineStorage[8]), L"NTFS driver (next start): %s", NtfsPath);
+    StrCpyS(LineStorage[9], 192, L"Hot directories...");
+    StrCpyS(LineStorage[10], 192, L"Use current panel paths at startup");
+    UnicodeSPrint(LineStorage[11], sizeof(LineStorage[11]), L"Verify after copy: %s",
+                  gEcConfig.VerifyAfterCopy ? L"On" : L"Off");
+    StrCpyS(LineStorage[12], 192, L"Back");
+    for (UINTN Index = 0; Index < SETTINGS_LINE_COUNT; Index++) Lines[Index] = LineStorage[Index];
+
+    if (!GuiDrawListPicker(L"EC Settings - changes save immediately",
+                           Lines, SETTINGS_LINE_COUNT, &Chosen) || Chosen == 12) {
+      return;
+    }
+
+    switch (Chosen) {
+      case 0:
+        gEcConfig.ConfirmDelete = !gEcConfig.ConfirmDelete;
+        SaveConfigOrReport();
+        break;
+      case 1:
+        gEcConfig.ConfirmOverwrite = !gEcConfig.ConfirmOverwrite;
+        SaveConfigOrReport();
+        break;
+      case 2:
+        gEcConfig.ShowSuccessMessages = !gEcConfig.ShowSuccessMessages;
+        SaveConfigOrReport();
+        break;
+      case 3:
+        gEcConfig.ShowOperationSummary = !gEcConfig.ShowOperationSummary;
+        SaveConfigOrReport();
+        break;
+      case 4:
+      case 5: {
+        CHAR16 Value[MAX_PATH_LEN];
+        CHAR16* Target = (Chosen == 4) ? gEcConfig.DefaultLeft : gEcConfig.DefaultRight;
+        StrCpyS(Value, MAX_PATH_LEN, Target);
+        if (GuiDrawInputBox(L"Startup path", L"Path (empty uses automatic):", Value, MAX_PATH_LEN)) {
+          StrCpyS(Target, MAX_PATH_LEN, Value);
+          SaveConfigOrReport();
+        }
+        break;
+      }
+      case 6:
+      case 7: {
+        CHAR16 Value[128];
+        CHAR16* Target = (Chosen == 6) ? gEcConfig.FilterLeft : gEcConfig.FilterRight;
+        PANEL* TargetPanel = (Chosen == 6) ? LeftPanel : RightPanel;
+        StrCpyS(Value, 128, Target);
+        if (GuiDrawInputBox(L"Panel filter", L"Mask; empty means *:", Value, 128)) {
+          if (Value[0] == L'\0') StrCpyS(Value, 128, L"*");
+          StrCpyS(Target, 128, Value);
+          PanelSetFilter(TargetPanel, Value);
+          SaveConfigOrReport();
+        }
+        break;
+      }
+      case 8: {
+        CHAR16 Value[MAX_PATH_LEN];
+        StrCpyS(Value, MAX_PATH_LEN, gEcConfig.NtfsDriverSetting);
+        if (GuiDrawInputBox(L"NTFS driver", L"Path (empty means next to EC):", Value, MAX_PATH_LEN)) {
+          StrCpyS(gEcConfig.NtfsDriverSetting, MAX_PATH_LEN, Value);
+          SaveConfigOrReport();
+        }
+        break;
+      }
+      case 9:
+        ShowHotDirectorySettings();
+        break;
+      case 10:
+        StrCpyS(gEcConfig.DefaultLeft, MAX_PATH_LEN, LeftPanel->Path);
+        StrCpyS(gEcConfig.DefaultRight, MAX_PATH_LEN, RightPanel->Path);
+        SaveConfigOrReport();
+        break;
+      case 11:
+        gEcConfig.VerifyAfterCopy = !gEcConfig.VerifyAfterCopy;
+        SaveConfigOrReport();
+        break;
+    }
+  }
+}
+
+// Symbol-based selection shortcuts are not equally easy to enter on every
+// firmware keyboard layout, so expose the same operations from F9 as well.
+// Returns TRUE when an operation was performed and the program menu should
+// close, letting the user see its result immediately.
+static BOOLEAN ShowSelectionMenu(IN OUT PANEL* ActivePanel)
+{
+  STATIC CONST CHAR16* Lines[] = {
+    L"Select all  [Ctrl+A]",
+    L"Select by mask...  [+]",
+    L"Unselect by mask...  [-]",
+    L"Invert selection  [*]",
+    L"Clear selection  [Ctrl+U]",
+    L"Back"
+  };
+  UINTN Chosen = 0;
+
+  for (;;) {
+    if (!GuiDrawListPicker(L"Selection tools", Lines, ARRAY_SIZE(Lines), &Chosen)) return FALSE;
+    switch (Chosen) {
+      case 0:
+        PanelOpsSelectByMask(ActivePanel, L"*", TRUE);
+        return TRUE;
+      case 1: {
+        CHAR16 Mask[128] = L"*";
+        if (GuiDrawInputBox(L"Select", L"Select mask:", Mask, ARRAY_SIZE(Mask))) {
+          PanelOpsSelectByMask(ActivePanel, Mask, TRUE);
+          return TRUE;
+        }
+        break;
+      }
+      case 2: {
+        CHAR16 Mask[128] = L"*";
+        if (GuiDrawInputBox(L"Unselect", L"Unselect mask:", Mask, ARRAY_SIZE(Mask))) {
+          PanelOpsSelectByMask(ActivePanel, Mask, FALSE);
+          return TRUE;
+        }
+        break;
+      }
+      case 3:
+        PanelOpsInvertSelection(ActivePanel);
+        return TRUE;
+      case 4:
+        PanelOpsClearSelection(ActivePanel);
+        return TRUE;
+      default:
+        return FALSE;
+    }
+  }
+}
+
+static VOID ShowCurrentFileChecksum(IN PANEL* ActivePanel)
+{
+  CHAR16 Path[MAX_PATH_LEN];
+  CHAR16 Sha256[65];
+  CHAR16 Half[33];
+  CHAR16 Message[256];
+  EC_FILE_CHECKSUM Result;
+  EFI_STATUS Status;
+
+  if (!GetCurrentItemPath(ActivePanel, Path)) {
+    GuiDrawMsgBox(L"Checksum", L"Select a file first.");
+    return;
+  }
+  if (ActivePanel->Files[ActivePanel->SelectedIndex].IsDirectory) {
+    GuiDrawMsgBox(L"Checksum", L"Checksums are available for files only.");
+    return;
+  }
+
+  GuiDrawSearchProgress(Path, L"SHA-256 + CRC32", 0);
+  Status = ChecksumFile(Path, &Result);
+  if (EFI_ERROR(Status)) {
+    UnicodeSPrint(Message, sizeof(Message), L"Could not read the file: %r", Status);
+    GuiDrawMsgBox(L"Checksum error", Message);
+    return;
+  }
+
+  ChecksumSha256ToText(Result.Sha256, Sha256);
+  // 64 hex digits do not fit one dialog line at every resolution, so the digest
+  // is split in the middle by hand rather than by a precision specifier.
+  StrnCpyS(Half, ARRAY_SIZE(Half), Sha256, 32);
+  UnicodeSPrint(Message, sizeof(Message),
+                L"CRC32: %08x\nSHA-256: %s\n         %s",
+                Result.Crc32, Half, &Sha256[32]);
+  GuiDrawMsgBox(L"File checksum", Message);
+}
+
+static VOID ShowRecursiveSync(IN OUT PANEL* LeftPanel, IN OUT PANEL* RightPanel)
+{
+  EC_SYNC_SUMMARY Summary;
+  EC_SYNC_RESULT Result;
+  EFI_STATUS Status;
+  CHAR16 Message[320];
+  STATIC CONST CHAR16* Actions[] = {
+    L"Update RIGHT from LEFT (keep right-only entries)",
+    L"Update LEFT from RIGHT (keep left-only entries)",
+    L"Close"
+  };
+  UINTN Chosen = 0;
+  CONST CHAR16* Source;
+  CONST CHAR16* Destination;
+
+  if (LeftPanel->Path[0] == L'\0' || RightPanel->Path[0] == L'\0') {
+    GuiDrawMsgBox(L"Recursive compare", L"Choose a directory in both panels first.");
+    return;
+  }
+  if (StrCmp(LeftPanel->Path, RightPanel->Path) == 0) {
+    GuiDrawMsgBox(L"Recursive compare", L"Both panels show the same directory.");
+    return;
+  }
+
+  GuiDrawSearchProgress(LeftPanel->Path, L"recursive SHA-256 compare", 0);
+  Status = SyncCompareTrees(LeftPanel->Path, RightPanel->Path, &Summary);
+  if (EFI_ERROR(Status)) {
+    UnicodeSPrint(Message, sizeof(Message), L"Comparison failed: %r", Status);
+    GuiDrawMsgBox(L"Recursive compare", Message);
+    return;
+  }
+
+  UnicodeSPrint(Message, sizeof(Message),
+                L"Only left: %d   Only right: %d\nDifferent: %d   Equal files: %d\nCommon directories: %d",
+                (UINT32)Summary.LeftOnly, (UINT32)Summary.RightOnly,
+                (UINT32)Summary.Different, (UINT32)Summary.EqualFiles,
+                (UINT32)Summary.CommonDirectories);
+  GuiDrawMsgBox(L"Recursive comparison", Message);
+
+  if (Summary.LeftOnly == 0 && Summary.RightOnly == 0 && Summary.Different == 0) return;
+  if (!GuiDrawListPicker(L"One-way directory update", Actions, ARRAY_SIZE(Actions), &Chosen) || Chosen == 2) {
+    return;
+  }
+
+  Source = Chosen == 0 ? LeftPanel->Path : RightPanel->Path;
+  Destination = Chosen == 0 ? RightPanel->Path : LeftPanel->Path;
+  UnicodeSPrint(Message, sizeof(Message),
+                L"Copy missing/different entries from %s to %s? Destination-only entries will be kept.",
+                Source, Destination);
+  if (GuiDrawConfirmDialog(L"Confirm directory update", Message, FALSE) != 1) return;
+
+  GuiDrawSearchProgress(Source, L"updating destination", 0);
+  Status = SyncUpdateTree(Source, Destination, &Result);
+  PanelRefresh(LeftPanel);
+  PanelRefresh(RightPanel);
+  UnicodeSPrint(Message, sizeof(Message),
+                L"Copied files: %d   copied trees: %d\nReplaced: %d   equal skipped: %d\nErrors: %d   status: %r",
+                (UINT32)Result.CopiedFiles, (UINT32)Result.CopiedTrees,
+                (UINT32)Result.ReplacedEntries, (UINT32)Result.SkippedEqual,
+                (UINT32)Result.Errors, Status);
+  GuiDrawMsgBox(EFI_ERROR(Status) ? L"Directory update incomplete" : L"Directory update complete", Message);
+}
+
+static VOID RunCurrentEfiWithArguments(IN PANEL* ActivePanel)
+{
+  CHAR16 Path[MAX_PATH_LEN];
+  CHAR16 Arguments[256] = { 0 };
+  CHAR16 Message[256];
+  EFI_STATUS Status;
+
+  if (!GetCurrentItemPath(ActivePanel, Path) ||
+      ActivePanel->Files[ActivePanel->SelectedIndex].IsDirectory) {
+    GuiDrawMsgBox(L"Run EFI", L"Select an EFI application first.");
+    return;
+  }
+  if (!GuiDrawInputBox(L"Run EFI application", L"Arguments (empty is allowed):",
+                       Arguments, ARRAY_SIZE(Arguments))) return;
+  Status = FsStartEfiAppWithArgs(gImageHandle, Path, Arguments);
+  if (EFI_ERROR(Status)) {
+    UnicodeSPrint(Message, sizeof(Message), L"Application returned: %r", Status);
+    GuiDrawMsgBox(L"Run EFI", Message);
+  }
+}
+
+static VOID ShowUefiTools(
+  IN OUT PANEL* LeftPanel,
+  IN OUT PANEL* RightPanel,
+  IN PANEL* ActivePanel
+)
+{
+  STATIC CONST CHAR16* Lines[] = {
+    L"Current volume details",
+    L"Rescan devices and filesystems",
+    L"Load selected EFI image as driver...",
+    L"BootOrder / BootNext entries (read-only)",
+    L"Back"
+  };
+  UINTN Chosen = 0;
+
+  for (;;) {
+    if (!GuiDrawListPicker(L"UEFI tools", Lines, ARRAY_SIZE(Lines), &Chosen) || Chosen == 4) return;
+    switch (Chosen) {
+      case 0: {
+        FS_VOLUME* Volume = FsFindVolumeForPath(ActivePanel->Path);
+        UINT64 Total = 0;
+        UINT64 Free = 0;
+        UINT32 BlockSize = 0;
+        BOOLEAN ReadOnly = FALSE;
+        CHAR16 Label[64] = { 0 };
+        CHAR16 Message[320];
+        EFI_STATUS Status;
+        if (Volume == NULL) {
+          GuiDrawMsgBox(L"Volume details", L"Choose a mounted volume first.");
+          break;
+        }
+        Status = FsGetVolumeDetails(Volume, &Total, &Free, &BlockSize, &ReadOnly,
+                                    Label, ARRAY_SIZE(Label));
+        if (EFI_ERROR(Status)) {
+          UnicodeSPrint(Message, sizeof(Message), L"Could not read volume information: %r", Status);
+        } else {
+          UnicodeSPrint(Message, sizeof(Message),
+                        L"Volume: %s   Label: %s\nTotal: %ld bytes   Free: %ld bytes\nBlock: %d bytes   Read-only: %s",
+                        Volume->Name, Label[0] != L'\0' ? Label : L"<none>",
+                        Total, Free, BlockSize, ReadOnly ? L"Yes" : L"No");
+        }
+        GuiDrawMsgBox(L"Volume details", Message);
+        break;
+      }
+      case 1:
+        FsRescanDevices();
+        PanelRefresh(LeftPanel);
+        PanelRefresh(RightPanel);
+        GuiDrawMsgBox(L"UEFI tools", L"Controllers reconnected and filesystems rescanned.");
+        break;
+      case 2: {
+        CHAR16 Path[MAX_PATH_LEN];
+        CHAR16 Prompt[256];
+        EFI_STATUS Status;
+        if (!GetCurrentItemPath(ActivePanel, Path) ||
+            ActivePanel->Files[ActivePanel->SelectedIndex].IsDirectory) {
+          GuiDrawMsgBox(L"Load EFI driver", L"Select an EFI driver image first.");
+          break;
+        }
+        UnicodeSPrint(Prompt, sizeof(Prompt), L"Start %s as an EFI driver?", Path);
+        if (GuiDrawConfirmDialog(L"Load EFI driver", Prompt, FALSE) != 1) break;
+        Status = FsStartEfiDriver(gImageHandle, Path);
+        PanelRefresh(LeftPanel);
+        PanelRefresh(RightPanel);
+        UnicodeSPrint(Prompt, sizeof(Prompt), L"Driver start result: %r", Status);
+        GuiDrawMsgBox(L"Load EFI driver", Prompt);
+        break;
+      }
+      case 3:
+        UefiToolsShowBootEntries();
+        break;
+    }
+  }
+}
+
+// Returns TRUE only when the user chooses to quit EC.
+static BOOLEAN ShowProgramMenu(
+  IN OUT PANEL* LeftPanel,
+  IN OUT PANEL* RightPanel,
+  IN BOOLEAN LeftActive,
+  IN OUT BOOLEAN* QuickView
+)
+{
+  STATIC CONST CHAR16* Lines[] = {
+    L"Refresh both panels",
+    L"Change active drive...  [F2]",
+    L"Find file in active tree...  [Alt+F7]",
+    L"Compare panel directories  [=]",
+    L"Recursive compare / update...",
+    L"Checksum selected file...",
+    L"Toggle Quick View  [Ctrl+Q]",
+    L"Run selected EFI with arguments...",
+    L"UEFI tools...",
+    L"Selection tools...",
+    L"Set active panel filter...  [Ctrl+F12]",
+    L"Directory hotlist...  [Alt+F10]",
+    L"Settings...",
+    L"Help  [F1]",
+    L"Quit EC  [F10]",
+    L"Close menu"
+  };
+  UINTN Chosen = 0;
+  PANEL* ActivePanel = LeftActive ? LeftPanel : RightPanel;
+  NAV_HISTORY* ActiveHistory = LeftActive ? &gLeftHistory : &gRightHistory;
+
+  for (;;) {
+    if (!GuiDrawListPicker(L"EC Menu", Lines, ARRAY_SIZE(Lines), &Chosen)) return FALSE;
+    switch (Chosen) {
+      case 0:
+        FsInit();
+        PanelRefresh(LeftPanel);
+        PanelRefresh(RightPanel);
+        return FALSE;
+      case 1: {
+        CHAR16 Before[MAX_PATH_LEN];
+        StrCpyS(Before, ARRAY_SIZE(Before), ActivePanel->Path);
+        ShowDriveMenu(LeftPanel, RightPanel, LeftActive, LeftActive);
+        if (StrCmp(Before, ActivePanel->Path) != 0) {
+          NavHistoryPush(ActiveHistory, ActivePanel->Path);
+        }
+        return FALSE;
+      }
+      case 2: {
+        CHAR16 HitDir[MAX_PATH_LEN];
+        CHAR16 HitName[256];
+        if (ActivePanel->Path[0] == L'\0') {
+          GuiDrawMsgBox(L"Find file", L"Choose a drive before searching.");
+          break;
+        }
+        if (SearchRunInteractive(ActivePanel->Path, HitDir, HitName)) {
+          StrCpyS(ActivePanel->Path, MAX_PATH_LEN, HitDir);
+          NavHistoryPush(ActiveHistory, ActivePanel->Path);
+          PanelRefreshKeep(ActivePanel, HitName, 0);
+        }
+        return FALSE;
+      }
+      case 3: {
+        UINTN Marked = PanelOpsCompareSelect(LeftPanel, RightPanel);
+        if (Marked == 0) {
+          GuiDrawMsgBox(L"Compare", L"The two directories agree.");
+        }
+        return FALSE;
+      }
+      case 4:
+        ShowRecursiveSync(LeftPanel, RightPanel);
+        return FALSE;
+      case 5:
+        ShowCurrentFileChecksum(ActivePanel);
+        break;
+      case 6:
+        if (QuickView != NULL) {
+          *QuickView = !*QuickView;
+          if (!*QuickView) GuiQuickViewReset();
+        }
+        return FALSE;
+      case 7:
+        RunCurrentEfiWithArguments(ActivePanel);
+        return FALSE;
+      case 8:
+        ShowUefiTools(LeftPanel, RightPanel, ActivePanel);
+        break;
+      case 9:
+        if (ShowSelectionMenu(ActivePanel)) return FALSE;
+        break;
+      case 10: {
+        CHAR16 Mask[128];
+        StrCpyS(Mask, ARRAY_SIZE(Mask), ActivePanel->FilterMask);
+        if (GuiDrawInputBox(L"Filter", L"Show mask (* clears):", Mask, ARRAY_SIZE(Mask))) {
+          PanelSetFilter(ActivePanel, Mask);
+          return FALSE;
+        }
+        break;
+      }
+      case 11:
+        NavShowHotlist(ActivePanel, ActiveHistory);
+        return FALSE;
+      case 12:
+        ShowSettingsMenu(LeftPanel, RightPanel);
+        break;
+      case 13:
+        GuiDrawHelp();
+        break;
+      case 14:
+        return TRUE;
+      default:
+        return FALSE;
+    }
+  }
+}
+
 EFI_STATUS EFIAPI
 UefiMain (
   IN EFI_HANDLE        ImageHandle,
@@ -322,6 +834,15 @@ UefiMain (
   // Re-scan volumes in case NTFS driver added new ones
   FsInit();
 
+  // Scripted run for the harness. Compiled out of the release build entirely,
+  // and even in a self-test build it only fires when the boot volume carries
+  // the flag file, so the same binary is still a usable file manager.
+  if (EcSelfTestMaybeRun(ImageHandle)) {
+    UiConsoleShutdown();
+    gST->ConOut->SetMode(gST->ConOut, originalTextMode);
+    return EFI_SUCCESS;
+  }
+
   // Set up panels
   PANEL leftPanel;
   PANEL rightPanel;
@@ -345,6 +866,7 @@ UefiMain (
 
   BOOLEAN leftActive = TRUE;
   BOOLEAN quit = FALSE;
+  BOOLEAN quickView = FALSE;
   CHAR16 lastSearch[MAX_PATH_LEN] = { 0 };
   CHAR16 quickSearch[128] = { 0 };
   UINTN quickSearchLen = 0;
@@ -354,13 +876,12 @@ UefiMain (
     PANEL* inactivePanel = leftActive ? &rightPanel : &leftPanel;
     NAV_HISTORY* activeHistory = leftActive ? &gLeftHistory : &gRightHistory;
 
-    UINTN width, height;
-    UiGfxGetDimensions(&width, &height);
-    UINTN pH = height - 80;
+    UINTN pH = GuiPanelHeight();
     UINTN pageSize = GuiGetPageSize(pH);
 
     // 1. Draw panels and menu
     GuiDrawPanels(&leftPanel, &rightPanel, leftActive);
+    if (quickView) GuiDrawQuickView(activePanel, (BOOLEAN)!leftActive);
     GuiDrawBottomMenu();
 
     // 2. Flush backbuffer to screen
@@ -417,6 +938,20 @@ UefiMain (
         ShowDriveMenu(&leftPanel, &rightPanel, leftActive, FALSE);
         if (StrCmp(before, rightPanel.Path) != 0) NavHistoryPush(&gRightHistory, rightPanel.Path);
         continue;
+      } else if (key.ScanCode == SCAN_F7) {
+        // Find a file anywhere under the active panel's directory. A hit taken
+        // from the list moves the panel to the directory holding it, with the
+        // cursor already on the entry - the point is to get there, not just to
+        // learn that it exists.
+        CHAR16 hitDir[MAX_PATH_LEN];
+        CHAR16 hitName[256];
+        if (activePanel->Path[0] != L'\0' &&
+            SearchRunInteractive(activePanel->Path, hitDir, hitName)) {
+          StrCpyS(activePanel->Path, MAX_PATH_LEN, hitDir);
+          NavHistoryPush(activeHistory, activePanel->Path);
+          PanelRefreshKeep(activePanel, hitName, 0);
+        }
+        continue;
       } else if (key.ScanCode == SCAN_F10) {
         NavShowHotlist(activePanel, activeHistory);
         continue;
@@ -458,6 +993,22 @@ UefiMain (
             QuickFindReset(quickSearch, &quickSearchLen);
             PanelSetSortMode(activePanel, PANEL_SORT_SIZE);
             break;
+          case SCAN_F2: {
+            // Attributes and modification time of the entry under the cursor.
+            QuickFindReset(quickSearch, &quickSearchLen);
+            if (activePanel->SelectedIndex >= 0 &&
+                (UINTN)activePanel->SelectedIndex < activePanel->FileCount) {
+              FS_FILE_ITEM* item = &activePanel->Files[activePanel->SelectedIndex];
+              if (PanelOpsIsUsableItem(item)) {
+                CHAR16 target[MAX_PATH_LEN];
+                FsCombinePath(target, activePanel->Path, item->Name);
+                if (FilePropsEdit(target)) {
+                  PanelRefreshKeep(activePanel, item->Name, activePanel->SelectedIndex);
+                }
+              }
+            }
+            break;
+          }
           case SCAN_F12: {
             QuickFindReset(quickSearch, &quickSearchLen);
             CHAR16 mask[128];
@@ -844,14 +1395,18 @@ UefiMain (
         }
 
         case SCAN_F9:
-          // Refresh panels manually
-          FsInit();
-          PanelRefresh(&leftPanel);
-          PanelRefresh(&rightPanel);
+          QuickFindReset(quickSearch, &quickSearchLen);
+          if (ShowProgramMenu(&leftPanel, &rightPanel, leftActive, &quickView)) quit = TRUE;
           break;
       }
     } else {
       // Handle Unicode Characters
+      if (ctrlPressed && (key.UnicodeChar == L'q' || key.UnicodeChar == L'Q' || key.UnicodeChar == 17)) {
+        QuickFindReset(quickSearch, &quickSearchLen);
+        quickView = !quickView;
+        if (!quickView) GuiQuickViewReset();
+        continue;
+      }
       if (ctrlPressed && (key.UnicodeChar == L'a' || key.UnicodeChar == L'A' || key.UnicodeChar == 1)) {
         QuickFindReset(quickSearch, &quickSearchLen);
         PanelOpsSelectByMask(activePanel, L"*", TRUE);
@@ -881,6 +1436,19 @@ UefiMain (
           QuickFindReset(quickSearch, &quickSearchLen);
           PanelOpsInvertSelection(activePanel);
           break;
+
+        case L'=': {
+          // Compare the two panels and light up whatever differs. It joins the
+          // family of selection keys - '+' by mask, '-' by mask, '*' inverts -
+          // and needs no modifier, which matters on consoles that swallow Alt.
+          UINTN marked;
+          QuickFindReset(quickSearch, &quickSearchLen);
+          marked = PanelOpsCompareSelect(&leftPanel, &rightPanel);
+          if (marked == 0) {
+            GuiDrawMsgBox(L"Compare", L"The two directories agree.");
+          }
+          break;
+        }
 
         case L'+': {
           QuickFindReset(quickSearch, &quickSearchLen);
@@ -960,6 +1528,7 @@ UefiMain (
   // flag and flushes any buffered writes to the physical medium, so Windows
   // doesn't offer a chkdsk on the next boot after we've been editing files.
   FsUnmountAllNtfs();
+  GuiQuickViewReset();
 
   // Free resources and restore screen
   PanelFree(&leftPanel);
