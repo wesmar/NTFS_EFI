@@ -169,6 +169,7 @@ flowchart TB
 | Sparse runs | Detected from the run's own offset-size nibble (`OffBytes == 0`). An LCN delta of zero is a legitimate fragment placement, so it is never treated as a hole |
 | LZNT1-compressed `$DATA` | Full decompressor ported from the NT source (`RtlDecompressBufferLZNT1`); handles the "stored uncompressed" unit form and the compressed-run-plus-hole form |
 | WOF-backed files | Reads `WofCompressedData` and decodes all four CompactOS algorithms: XPRESS4K, XPRESS8K, XPRESS16K and LZX; unsupported providers fail closed |
+| WOF chunk reads | A chunk starts wherever the previous one ended, so its offset in the stream is arbitrary. Reads are widened to whole sectors: firmware DiskIo can refuse an unaligned multi-sector span outright, which is indistinguishable from a corrupt chunk |
 | EFS streams | Refused with `EFI_UNSUPPORTED` rather than returning zeros |
 | Directory enumeration | In-order B+tree walk across `$INDEX_ROOT` and every `$INDEX_ALLOCATION` `INDX` block, cached per handle on first `Read()` |
 | Path lookup | Multi-level, `\` and `/` normalised, case-insensitive through the on-disk `$UpCase` table |
