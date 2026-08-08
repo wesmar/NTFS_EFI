@@ -79,13 +79,17 @@ UEFI firmware reads and writes FAT12/FAT16/FAT32 and nothing else. Every task th
 
 EfiNtfs closes that gap at the firmware layer. The driver is a DXE-loadable UEFI driver of a few hundred kilobytes that hands NTFS volumes to the rest of the firmware through the standard protocol, so the caller does not know or care that the volume is not FAT.
 
-| Approach | What it costs | NTFS write |
+The ways of reaching an NTFS partition before an operating system starts, and what each one costs:
+
+| Way in | What it costs | Can it write to NTFS? |
 |---|---|---|
-| Firmware FAT driver | nothing, it is already there | none at all |
-| WinPE / Windows RE | ~400 MB image, a full Windows kernel boot | yes |
-| Linux initrd + `ntfs-3g` | 50-200 MB image, Linux kernel, FUSE, POSIX layer | yes |
-| Read-only UEFI NTFS drivers | one small driver binary | read only |
-| **EfiNtfs (`ntfs.efi`)** | **one UEFI driver binary, `BlockIo` + `DiskIo` and nothing else** | **yes, chkdsk-clean** |
+| The FAT driver already in the firmware | nothing, it is already there | No — it does not see NTFS at all |
+| WinPE / Windows RE | ~400 MB image, a full Windows kernel boot | Yes |
+| Linux initrd + `ntfs-3g` | 50-200 MB image, Linux kernel, FUSE, POSIX layer | Yes |
+| Other UEFI NTFS drivers (EfiFs, the rEFInd set) | one small driver binary | No — they read NTFS, they refuse every write |
+| **EfiNtfs (`ntfs.efi`)** | **one UEFI driver binary, `BlockIo` + `DiskIo` and nothing else** | **Yes, and the volume stays chkdsk-clean** |
+
+The last two rows are the point: a small UEFI driver has always been the cheapest way in, and until now it could only read.
 
 Design constraints that shaped the code:
 
