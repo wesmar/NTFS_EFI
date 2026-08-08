@@ -168,7 +168,7 @@ flowchart TB
 | Non-resident `$DATA` | Mapping pairs decoded once into a flat `NTFS_RUN_ENTRY` array (up to 2048 extents per attribute); multi-extent reads served from it |
 | Sparse runs | Detected from the run's own offset-size nibble (`OffBytes == 0`). An LCN delta of zero is a legitimate fragment placement, so it is never treated as a hole |
 | LZNT1-compressed `$DATA` | Full decompressor ported from the NT source (`RtlDecompressBufferLZNT1`); handles the "stored uncompressed" unit form and the compressed-run-plus-hole form |
-| WOF-backed files | Reads `WofCompressedData` and decodes XPRESS4K, XPRESS8K and XPRESS16K chunks; unsupported providers and algorithms fail closed |
+| WOF-backed files | Reads `WofCompressedData` and decodes all four CompactOS algorithms: XPRESS4K, XPRESS8K, XPRESS16K and LZX; unsupported providers fail closed |
 | EFS streams | Refused with `EFI_UNSUPPORTED` rather than returning zeros |
 | Directory enumeration | In-order B+tree walk across `$INDEX_ROOT` and every `$INDEX_ALLOCATION` `INDX` block, cached per handle on first `Read()` |
 | Path lookup | Multi-level, `\` and `/` normalised, case-insensitive through the on-disk `$UpCase` table |
@@ -438,7 +438,7 @@ NTFS_EFI/
 │   ├── ntfs_setinfo.c        # SetInfo timestamps and attributes, rename, move, resize, prealloc trim
 │   ├── ntfs_file.c           # Handle factory, path lookup, all EFI_FILE_PROTOCOL methods, dir cache
 │   ├── ntfs_lznt1.c          # LZNT1 decompressor, ported from the NT source codec
-│   ├── ntfs_wof.c            # WOF reparse reader and XPRESS4K/8K/16K decompressor
+│   ├── ntfs_wof.c            # WOF reparse reader, XPRESS-Huffman and LZX decompressors
 │   ├── ntfs_symlink.c        # $REPARSE_POINT symlink target resolver
 │   ├── ntfs_time.c           # NTFS 100 ns ticks to and from EFI_TIME
 │   ├── ntfs_globals.c        # GUIDs, PCD/HII stubs, debug print, performance counters
@@ -599,6 +599,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | `$MFT` exhaustion on a fresh volume, Hyper-V | Same setup on a 20 GB volume with contiguous free space: 30 directories of 1000 files each, created after the last free record was taken | 30 000 of 30 000 created and visible to Windows, `$MFT` grown to 30 976 records in 31 runs, `chkdsk` reports *found no problems* |
 | Probe battery on a fresh volume, Hyper-V | Interleaved writes, hole punching, 48 files created and deleted in the volume root, a nested tree deleted recursively | Every phase passes and the volume is left `chkdsk`-clean, including the `$BITMAP:$I30` state of the root directory, which earlier builds left with allocated blocks holding no keys |
 | Fill and drain one directory, Hyper-V | 2000 files with long names created in one directory through the driver, then every one of them deleted | 2000 created, 2000 deleted, `chkdsk` reports *found no problems*, and `$INDEX_ALLOCATION` is back to a single 4 KB block in one run — 88 bytes of attribute in the directory's own record |
+| WOF LZX read, Hyper-V | Four real Windows binaries compacted with `compact /c /exe:LZX` — 72 KB to 7.6 MB, up to 243 chunks — read back through the driver | Every file byte-exact against the same file read by Windows, checked by full-file checksum: `xcopy.exe` 73 728, `notepad.exe` 360 448, `cmd.exe` 344 064, `shell32.dll` 7 947 416 bytes |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
 
@@ -626,11 +627,11 @@ Each of these is a boundary the code refuses at, with the operation left unchang
 2. **Write path assumes a single base MFT record.** `$ATTRIBUTE_LIST` is followed on read — and an index whose `$INDEX_ROOT` and `$INDEX_ALLOCATION` were relocated into *different* records is written correctly — but the driver never creates extension records itself. So a file whose attributes would overflow its 1 KB record cannot be written, and a directory keeps accepting new entries only while `$INDEX_ALLOCATION`'s mapping pairs still fit in that record. Index blocks are allocated 8 to a run and unused owned blocks are reused, which keeps that cost low — 1854 long-named entries in one directory need 249 blocks described in 216 bytes — but the budget is finite. When it runs out the insert returns `EFI_UNSUPPORTED` with nothing modified, and every entry already there stays intact and visible.
 3. **Hard links.** Only files with `LinkCount == 1` are deleted; a name that shares its record with another directory entry is refused, so a record another name still points at is never freed.
 4. **No `$LogFile` journal.** Integrity rests on ordered writes, explicit rollback and the `$Volume` dirty flag. After an unclean shutdown Windows will offer to run `chkdsk` — the correct conservative outcome.
-5. **No compression on write.** LZNT1 and WOF/XPRESS are decompress-only; compressed attributes are read, never rewritten.
+5. **No compression on write.** LZNT1 and both WOF codecs are decompress-only; compressed attributes are read, never rewritten.
 6. **Separator-key deletion can still be refused.** Rebalancing handles the normal cases; the rare replacement key that would overflow the host block returns `EFI_UNSUPPORTED` rather than restructuring further.
 7. **2048 extents per attribute.** Enough for any realistic file given run merging, but a pathologically fragmented attribute is rejected instead of truncated.
 8. **`$MFT` growth ends where record 0 runs out of mapping pairs.** The table and its bitmap both grow, but every chunk that lands away from the previous extent costs one mapping pair inside MFT record 0, and that record is 1 KB with no `$ATTRIBUTE_LIST` to spill into. Chunks of 256 clusters buy 1024 records per pair, so this is far away on a volume with contiguous free space: measured on a fragmented Windows volume with no free record left, growth continued for 6344 more files and stopped at 143 872 records with 156 runs, returning `EFI_VOLUME_FULL` with nothing modified. On a fresh volume the same test placed 30 000 files in 31 runs.
-9. **Automated coverage is uneven.** Create, write, delete, rename, move, `SetInfo`, B+tree splits and the copy paths are covered by the harness. The LZNT1, symlink and 8.3 short-name read paths are implemented but not yet fixtured for every edge case.
+9. **Automated coverage is uneven.** Create, write, delete, rename, move, `SetInfo`, B+tree splits, the copy paths and both WOF codecs are covered by the harness. The LZNT1, symlink and 8.3 short-name read paths are implemented but not yet fixtured for every edge case.
 10. **Little-endian x64 only.** On-disk structures are raw struct overlays; a big-endian target would need byte-swapping accessors.
 
 ---
