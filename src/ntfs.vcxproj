@@ -137,5 +137,8 @@
     <ClInclude Include="ntfs.h" />
     <ClInclude Include="DebugLog.h" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="ntfs.rc" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

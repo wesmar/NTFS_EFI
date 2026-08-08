@@ -109,5 +109,8 @@
   <ItemGroup>
     <ClCompile Include="ntfs_probe.c" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="ntfs_probe.rc" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
