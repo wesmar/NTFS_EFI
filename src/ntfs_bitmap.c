@@ -420,7 +420,14 @@ NtfsGrowMftBitmap (
 
 /* First clear bit in [NTFS_FILE_FIRST_USER_FILE, Limit), or FALSE when every
  * one of them is taken. Records below NTFS_FILE_FIRST_USER_FILE belong to
- * volume metadata even where their bit happens to read as free. */
+ * volume metadata even where their bit happens to read as free.
+ *
+ * A byte that reads 0xFF is eight taken records: step over it whole, the same
+ * way the cluster scan above steps over fully allocated regions. An aged
+ * Windows volume has a long solid stretch at the low end of this bitmap - a
+ * 137 000-record table is 17 KB of bits, nearly all of them set - and walking
+ * it a bit at a time on every single create is the cost this removes. The
+ * answer is the same either way: the first clear bit. */
 static BOOLEAN
 NtfsFirstFreeBit (
     IN  CONST UCHAR *BmBuf,
@@ -428,13 +435,28 @@ NtfsFirstFreeBit (
     OUT UINT64      *FreeBit
     )
 {
-    UINT64 Bit;
+    UINT64 Bit = NTFS_FILE_FIRST_USER_FILE;
 
-    for (Bit = NTFS_FILE_FIRST_USER_FILE; Bit < Limit; Bit++) {
+    while (Bit < Limit) {
+        if ((Bit & 7) == 0) {
+            /* whole all-ones 8-byte words first, then single all-ones bytes */
+            while (Bit + 64 <= Limit &&
+                   BmBuf[Bit/8+0]==0xFF && BmBuf[Bit/8+1]==0xFF &&
+                   BmBuf[Bit/8+2]==0xFF && BmBuf[Bit/8+3]==0xFF &&
+                   BmBuf[Bit/8+4]==0xFF && BmBuf[Bit/8+5]==0xFF &&
+                   BmBuf[Bit/8+6]==0xFF && BmBuf[Bit/8+7]==0xFF) {
+                Bit += 64;
+            }
+            while (Bit + 8 <= Limit && BmBuf[Bit / 8] == 0xFF) {
+                Bit += 8;
+            }
+            if (Bit >= Limit) break;
+        }
         if (!((BmBuf[Bit / 8] >> (Bit % 8)) & 1)) {
             *FreeBit = Bit;
             return TRUE;
         }
+        Bit++;
     }
     return FALSE;
 }

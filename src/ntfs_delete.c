@@ -649,13 +649,15 @@ NtfsTrimIndexAllocation (
     PNTFS_ATTR_RECORD Attr;
     NTFS_RUN_ENTRY   *Runs;
     PUCHAR            MP;
-    ULONG             RunCount = 0, i;
+    NTFS_RUN_ENTRY   *Drop;
+    ULONG             RunCount = 0, DropCount = 0, i;
     UINT64            ClustersPerBlock = Vcb->BytesPerIndexRecord / Vcb->BytesPerCluster;
     UINT64            KeepClusters, Seen = 0;
     UINTN             MPLen = 0;
     INT64             PrevLBN = 0;
     ULONG             OldAttrLen, NewAttrLen;
     LONG              Shrink;
+    EFI_STATUS        Written;
 
     if (ClustersPerBlock == 0) ClustersPerBlock = 1;
     KeepClusters = KeepBlocks * ClustersPerBlock;
@@ -670,30 +672,43 @@ NtfsTrimIndexAllocation (
     if ((UINT64)Attr->NonResident.HighestVCN + 1 <= KeepClusters) return;   /* nothing to give back */
 
     Runs = AllocatePool (NTFS_MAX_RUNS * sizeof (NTFS_RUN_ENTRY));
+    Drop = AllocatePool (NTFS_MAX_RUNS * sizeof (NTFS_RUN_ENTRY));
     MP   = AllocatePool (NTFS_MAX_RUNS * 9 + 8);
-    if (Runs == NULL || MP == NULL) {
+    if (Runs == NULL || Drop == NULL || MP == NULL) {
         if (Runs) FreePool (Runs);
+        if (Drop) FreePool (Drop);
         if (MP)   FreePool (MP);
         return;
     }
     if (EFI_ERROR (NtfsBuildRunList (Attr, Runs, NTFS_MAX_RUNS, &RunCount)) || RunCount == 0) {
         FreePool (Runs);
+        FreePool (Drop);
         FreePool (MP);
         return;
     }
 
-    /* walk the runs, keeping the first KeepClusters and freeing the rest */
+    /*
+     * Work out what goes, but do not release anything yet. A cluster must stay
+     * allocated until the record that stops pointing at it is on disk: free it
+     * first and a failed write leaves the old mapping pointing at space the
+     * volume considers free, which the next allocation can hand to another
+     * file. Failing the other way round only leaks, and that is recoverable.
+     */
     for (i = 0; i < RunCount; i++) {
         UINT64 Len = Runs[i].Len;
 
         if (Runs[i].LBN == -1LL) { Seen += Len; continue; }   /* sparse: nothing to free */
 
         if (Seen >= KeepClusters) {
-            NtfsEfiFreeClusters (Vcb, (UINT64)Runs[i].LBN, Len);
+            Drop[DropCount].LBN = Runs[i].LBN;
+            Drop[DropCount].Len = Len;
+            DropCount++;
             Runs[i].Len = 0;
         } else if (Seen + Len > KeepClusters) {
             UINT64 Head = KeepClusters - Seen;
-            NtfsEfiFreeClusters (Vcb, (UINT64)Runs[i].LBN + Head, Len - Head);
+            Drop[DropCount].LBN = Runs[i].LBN + (INT64)Head;
+            Drop[DropCount].Len = Len - Head;
+            DropCount++;
             Runs[i].Len = Head;
         }
         Seen += Len;
@@ -759,7 +774,15 @@ NtfsTrimIndexAllocation (
         }
     }
 
-    NtfsEfiWriteFileRecord (Vcb, AllocMFT, AllocRec);
+    Written = NtfsEfiWriteFileRecord (Vcb, AllocMFT, AllocRec);
+
+    /* the record no longer maps them, so now they can go back to $Bitmap */
+    if (!EFI_ERROR (Written)) {
+        for (i = 0; i < DropCount; i++) {
+            NtfsEfiFreeClusters (Vcb, (UINT64)Drop[i].LBN, Drop[i].Len);
+        }
+    }
+    FreePool (Drop);
 }
 
 /* If the index has no real entries but is still marked as having children,
