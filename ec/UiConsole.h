@@ -5,6 +5,12 @@
 #include <Uefi.h>
 
 BOOLEAN UiConsoleInit(IN EFI_SYSTEM_TABLE* SystemTable);
+
+// Takes the screen back after something else has had it - the Ctrl+O console
+// hands it to the firmware's text mode, which can leave the display in another
+// resolution. Rebuilds the back buffer only when it has to.
+BOOLEAN UiConsoleReclaimScreen(VOID);
+
 VOID    UiConsoleShutdown(VOID);
 UINTN   UiPrint(IN CONST CHAR16* Format, ...);
 UINTN   UiAsciiPrint(IN CONST CHAR8* Format, ...);

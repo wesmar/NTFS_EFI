@@ -10,9 +10,11 @@
  *    into the separator slot. If the subtree is empty the separator is simply
  *    removed. Only if the replacement would overflow the host block is the
  *    operation refused (EFI_UNSUPPORTED).
- *  - only single-linked files (LinkCount == 1) are deleted; a file with
- *    extra hard links in other directories is refused so we never free a
- *    record another name still points at.
+ *  - only files with one genuine name are deleted. An 8.3 alias is not a
+ *    second name: it lives in the same directory as its long name and both
+ *    are unlinked together, so it is not counted (NtfsCountRealNames). A file
+ *    another directory still names is refused, so we never free a record
+ *    another name still points at.
  *  - directories must be empty.
  *  - system records (< NTFS_FILE_FIRST_USER_FILE) are never touched.
  *
@@ -1492,7 +1494,7 @@ NtfsEfiDeleteFile (
     Status = NtfsRemoveOneDirEntryByChild (Vcb, ParentMFT, MFTIndex);
     if (Status == EFI_UNSUPPORTED) {
         Print (L"[delete] refused MFT=%ld under parent=%ld : name is a B+tree "
-               L"separator key with a subtree (rebalance-on-delete not implemented) "
+               L"separator key and its replacement would not fit the host node "
                L"- volume untouched\n", MFTIndex, ParentMFT);
         FreePool (Rec);
         return EFI_UNSUPPORTED;   /* separator key - nothing changed yet */

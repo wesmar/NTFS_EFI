@@ -656,6 +656,27 @@ BOOLEAN UiConsoleInit(IN EFI_SYSTEM_TABLE* SystemTable)
   return TRUE;
 }
 
+BOOLEAN UiConsoleReclaimScreen(VOID)
+{
+  if (!gGfxReady || gGop == NULL || gGop->Mode == NULL || gGop->Mode->Info == NULL) {
+    return gGfxReady;
+  }
+
+  // Firmware text output usually runs on the same GOP, and switching ConOut
+  // back can leave the display in a different resolution than the one the back
+  // buffer was built for. When the geometry survived, the next Blt takes the
+  // screen back on its own; when it did not, everything derived from it -
+  // buffer size, glyph scale, colour layout - has to be built again, which is
+  // what init does.
+  if (gGop->Mode->Info->HorizontalResolution == gFbWidth &&
+      gGop->Mode->Info->VerticalResolution == gFbHeight) {
+    return TRUE;
+  }
+
+  UiConsoleShutdown();
+  return UiConsoleInit(gST);
+}
+
 VOID UiConsoleShutdown(VOID)
 {
   if (gBackBuffer) {

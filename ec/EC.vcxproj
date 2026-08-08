@@ -121,6 +121,7 @@
     <ClCompile Include="Editor.c" />
     <ClCompile Include="Config.c" />
     <ClCompile Include="Navigation.c" />
+    <ClCompile Include="Console.c" />
     <ClCompile Include="Checksum.c" />
     <ClCompile Include="Sync.c" />
     <ClCompile Include="UefiTools.c" />
@@ -140,6 +141,7 @@
     <ClInclude Include="Editor.h" />
     <ClInclude Include="Config.h" />
     <ClInclude Include="Navigation.h" />
+    <ClInclude Include="Console.h" />
     <ClInclude Include="Checksum.h" />
     <ClInclude Include="Sync.h" />
     <ClInclude Include="UefiTools.h" />

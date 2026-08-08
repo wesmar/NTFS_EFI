@@ -19,6 +19,7 @@
 #include "Navigation.h"
 #include "Search.h"
 #include "FileProps.h"
+#include "Console.h"
 #include "SelfTest.h"
 #include "Checksum.h"
 #include "Sync.h"
@@ -72,6 +73,10 @@ static CHAR16 gCopySrc[MAX_PATH_LEN] = { 0 };
 static CHAR16 gCopyDst[MAX_PATH_LEN] = { 0 };
 static NAV_HISTORY gLeftHistory;
 static NAV_HISTORY gRightHistory;
+
+// The firmware's text mode as it was before EC took the screen. Kept here
+// because both the Ctrl+O console and the exit path have to give it back.
+static INT32 gOriginalTextMode = 0;
 
 static VOID CopyCallback(UINT64 Copied, UINT64 Total)
 {
@@ -788,6 +793,7 @@ static BOOLEAN ShowProgramMenu(
     L"Set active panel filter...  [Ctrl+F12]",
     L"Directory hotlist...  [Alt+F10]",
     L"Settings...",
+    L"Command line...  [Ctrl+O]",
     L"Help  [F1]",
     L"Quit EC  [F10]",
     L"Close menu"
@@ -871,9 +877,16 @@ static BOOLEAN ShowProgramMenu(
         ShowSettingsMenu(LeftPanel, RightPanel);
         break;
       case 13:
+        ConsoleRun(gImageHandle, gOriginalTextMode, ActivePanel);
+        UiConsoleReclaimScreen();
+        FsRescanDevices();
+        PanelRefresh(LeftPanel);
+        PanelRefresh(RightPanel);
+        return FALSE;
+      case 14:
         GuiDrawHelp();
         break;
-      case 14:
+      case 15:
         return TRUE;
       default:
         return FALSE;
@@ -894,7 +907,7 @@ UefiMain (
   gRT          = SystemTable->RuntimeServices;
 
   // Save original text mode
-  INT32 originalTextMode = SystemTable->ConOut->Mode->Mode;
+  gOriginalTextMode = SystemTable->ConOut->Mode->Mode;
 
   // Initialize Graphic GOP console
   if (!UiConsoleInit(SystemTable)) {
@@ -917,7 +930,7 @@ UefiMain (
   // the flag file, so the same binary is still a usable file manager.
   if (EcSelfTestMaybeRun(ImageHandle)) {
     UiConsoleShutdown();
-    gST->ConOut->SetMode(gST->ConOut, originalTextMode);
+    gST->ConOut->SetMode(gST->ConOut, gOriginalTextMode);
     return EFI_SUCCESS;
   }
 
@@ -1483,6 +1496,18 @@ UefiMain (
       }
     } else {
       // Handle Unicode Characters
+      // Ctrl+O drops to the command line. Firmware that reports no modifier
+      // state still delivers ^O as character 15, so both are accepted.
+      if ((ctrlPressed && (key.UnicodeChar == L'o' || key.UnicodeChar == L'O')) ||
+          key.UnicodeChar == 15) {
+        QuickFindReset(quickSearch, &quickSearchLen);
+        ConsoleRun(ImageHandle, gOriginalTextMode, activePanel);
+        UiConsoleReclaimScreen();
+        FsRescanDevices();
+        PanelRefreshKeep(&leftPanel, NULL, leftPanel.SelectedIndex);
+        PanelRefreshKeep(&rightPanel, NULL, rightPanel.SelectedIndex);
+        continue;
+      }
       if (ctrlPressed && (key.UnicodeChar == L'q' || key.UnicodeChar == L'Q' || key.UnicodeChar == 17)) {
         QuickFindReset(quickSearch, &quickSearchLen);
         quickView = !quickView;
@@ -1618,7 +1643,7 @@ UefiMain (
   UiConsoleShutdown();
 
   // Restore original text mode
-  gST->ConOut->SetMode(gST->ConOut, originalTextMode);
+  gST->ConOut->SetMode(gST->ConOut, gOriginalTextMode);
   gST->ConOut->ClearScreen(gST->ConOut);
   gST->ConOut->EnableCursor(gST->ConOut, TRUE);
 

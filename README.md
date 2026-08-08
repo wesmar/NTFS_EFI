@@ -462,6 +462,7 @@ NTFS_EFI/
 │   ├── Search.c              # Recursive find by name, mask or file contents, bounded and cancellable
 │   ├── FileProps.c           # DOS attribute bits and modification time of a single entry
 │   ├── UefiTools.c           # Read-only BootOrder / BootNext / Boot#### view
+│   ├── Console.c             # Ctrl+O prompt: built-in commands, UEFI Shell fallback
 │   ├── Navigation.c          # Per-panel path history, directory hotlist
 │   ├── Viewer.c              # Read-only viewer: text scrolling, hex dump, byte search
 │   ├── Editor.c              # Text and hex editor: line buffer, cursor, save
@@ -538,6 +539,7 @@ flowchart LR
 | Attributes | `Ctrl+F2` shows and edits the four DOS bits (read-only, hidden, system, archive) and the modification time; a field left alone is left alone on disk |
 | UEFI tools | Volume details (label, total, free, block size, read-only), a device and filesystem rescan, loading a selected image as an EFI driver, and a read-only view of `BootOrder`, `BootNext` and each `Boot####` description |
 | Running images | `Enter` launches an EFI application; the F9 menu can start one with an argument string passed as `LoadOptions`, the way the UEFI Shell would |
+| Command line | `Ctrl+O` puts the panels away and gives the firmware's text mode a prompt, the way `Ctrl+O` works in Norton Commander and Far. It carries its own commands — `map`, `cd`, `dir`, `type`, `copy`, `move`, `del`, `md`, `sha256`, `load`, `run`, `cls`, `reset`, `shutdown` — over the same code the panels use, with history on the arrow keys and quoting for names with spaces. A command it does not know is handed to `EFI_SHELL_PROTOCOL` if the firmware has one, which it does when EC was started from the UEFI Shell. Booted straight as `BOOTX64.EFI` there is no shell at all, and the built-in commands are the whole of it — which is the case the prompt exists for |
 | Settings | Every item in `F9 → Settings` is written to `EC.ini` the moment it changes |
 
 ### Keyboard reference
@@ -551,14 +553,15 @@ flowchart LR
 | `F9` | Program menu | `F10` | Quit |
 | `Alt+F1` / `Alt+F2` | Change left / right drive | `Alt+F7` | Find in the active tree |
 | `Alt+F10` | Directory hotlist | `Alt+←` / `Alt+→` | Path history back / forward |
-| `Ctrl+Q` | Quick View in the passive panel | `Ctrl+F2` | Attributes and modification time |
+| `Ctrl+O` | Command line, `exit` or `Ctrl+O` returns | `Ctrl+Q` | Quick View in the passive panel |
+| `Ctrl+F2` | Attributes and modification time | `Ctrl+F12` | Panel filter mask, `*` clears |
 | `Ctrl+F3` / `Ctrl+F4` | Sort by name / extension | `Ctrl+F5` / `Ctrl+F6` | Sort by date / size |
-| `Ctrl+F12` | Panel filter mask, `*` clears | `Ctrl+A` / `Ctrl+U` | Tag all / clear tags |
-| `Insert` / `Space` | Tag current item | `+` / `-` | Tag / untag by mask |
+| `Ctrl+A` / `Ctrl+U` | Tag all / clear tags | `Insert` / `Space` | Tag current item |
+| `+` / `-` | Tag / untag by mask | `Esc` | Close a dialog, abort an operation |
 | `*` | Invert tags | `=` | Tag what differs between the panels |
 | `Tab` | Switch active panel | `Enter` | Enter directory or launch an EFI application |
 | `Backspace` | Parent directory | letters | Quick prefix jump |
-| `/` then `N` | Find anywhere in name, repeat | `Esc` | Close a dialog, abort an operation |
+| `/` then `N` | Find anywhere in name, repeat | | |
 
 Inside the viewer: `F4` switches text and hex, `F7` finds ASCII text, `F3` finds the next occurrence. Inside the editor: `F2` saves, `F4` switches text and hex.
 
@@ -579,6 +582,7 @@ Inside the viewer: `F4` switches text and hex, `F7` finds ASCII text, `F3` finds
 | Set active panel filter | Same as `Ctrl+F12`, temporary for this session |
 | Directory hotlist | Same as `Alt+F10` |
 | Settings | The `EC.ini` options below, saved on every change |
+| Command line | Same as `Ctrl+O` |
 | Help | Same as `F1` |
 
 ### `EC.ini`
@@ -673,7 +677,7 @@ Success criterion for the quick cycle is the literal string `RESULT: ALL GOOD - 
 | Probe battery on a fresh volume, Hyper-V | Interleaved writes, hole punching, 48 files created and deleted in the volume root, a nested tree deleted recursively | Every phase passes and the volume is left `chkdsk`-clean, including the `$BITMAP:$I30` state of the root directory, which earlier builds left with allocated blocks holding no keys |
 | Fill and drain one directory, Hyper-V | 2000 files with long names created in one directory through the driver, then every one of them deleted | 2000 created, 2000 deleted, `chkdsk` reports *found no problems*, and `$INDEX_ALLOCATION` is back to a single 4 KB block in one run — 88 bytes of attribute in the directory's own record |
 | WOF LZX read, Hyper-V | Four real Windows binaries compacted with `compact /c /exe:LZX` — 72 KB to 7.6 MB, up to 243 chunks — read back through the driver | Every file byte-exact against the same file read by Windows, checked by full-file checksum: `xcopy.exe` 73 728, `notepad.exe` 360 448, `cmd.exe` 344 064, `shell32.dll` 7 947 416 bytes |
-| EC self-test, Hyper-V | `EC.efi` built with `-SelfTest`, booted against a scripted NTFS fixture: recursive search by name and by contents, attribute and timestamp editing, panel compare, SHA-256 and CRC32 vectors, verified copy, Quick View, recursive tree compare and one-way update with progress and cancellation, tree sizing, volume details, viewer byte search | 59 checks, `passed=59 failed=0`, the VM powering itself off and the result read back from the ESP. The content search is driven against a 70 000-byte file with the needle placed at offset 65 532, so a match across a read boundary fails the test rather than passing quietly |
+| EC self-test, Hyper-V | `EC.efi` built with `-SelfTest`, booted against a scripted NTFS fixture: recursive search by name and by contents, attribute and timestamp editing, panel compare, SHA-256 and CRC32 vectors, verified copy, Quick View, recursive tree compare and one-way update with progress and cancellation, tree sizing, volume details, viewer byte search, console line splitting and path resolution | 68 checks, `passed=68 failed=0`, the VM powering itself off and the result read back from the ESP. The content search is driven against a 70 000-byte file with the needle placed at offset 65 532, so a match across a read boundary fails the test rather than passing quietly |
 
 > **Verification discipline:** always attach the result image with `Mount-VHD -ReadOnly`. Given write access, Windows silently repairs a volume on first access, and a `chkdsk` run afterwards then reports a clean volume that the driver did not actually leave clean.
 
@@ -699,9 +703,9 @@ Each of these is a boundary the code refuses at, with the operation left unchang
 
 1. **No DOS 8.3 alias.** Files are created with a single POSIX `$FILE_NAME`. Windows handles them normally; very old tools that expect a short name will not see one.
 2. **Write path assumes a single base MFT record.** `$ATTRIBUTE_LIST` is followed on read — and an index whose `$INDEX_ROOT` and `$INDEX_ALLOCATION` were relocated into *different* records is written correctly — but the driver never creates extension records itself. So a file whose attributes would overflow its 1 KB record cannot be written, and a directory keeps accepting new entries only while `$INDEX_ALLOCATION`'s mapping pairs still fit in that record. Index blocks are allocated 8 to a run and unused owned blocks are reused, which keeps that cost low — 1854 long-named entries in one directory need 249 blocks described in 216 bytes — but the budget is finite. When it runs out the insert returns `EFI_UNSUPPORTED` with nothing modified, and every entry already there stays intact and visible.
-3. **Hard links.** Only files with `LinkCount == 1` are deleted; a name that shares its record with another directory entry is refused, so a record another name still points at is never freed.
+3. **Hard links.** A file is deleted only when it has one genuine name. An 8.3 alias is not a second one: a long-named file carries both a WIN32 and a DOS `$FILE_NAME` and so a raw `LinkCount` of 2, and both names are unlinked together. What is refused is a record a *different directory* still names, so a record another name points at is never freed.
 4. **No `$LogFile` journal.** Integrity rests on ordered writes, explicit rollback and the `$Volume` dirty flag. After an unclean shutdown Windows will offer to run `chkdsk` — the correct conservative outcome.
-5. **No compression on write.** LZNT1 and both WOF codecs are decompress-only; compressed attributes are read, never rewritten.
+5. **Compression is read-only.** LZNT1 and both WOF codecs — XPRESS-Huffman and LZX — decompress on read, so compressed and CompactOS files are fully readable. Nothing compresses on write: a byte-range write into a `$DATA` with a non-zero `CompressionUnit` would mean re-encoding the whole compression unit, so it returns `EFI_UNSUPPORTED` with nothing modified rather than writing plaintext into a compressed run.
 6. **Separator-key deletion can still be refused.** Rebalancing handles the normal cases; the rare replacement key that would overflow the host block returns `EFI_UNSUPPORTED` rather than restructuring further.
 7. **2048 extents per attribute.** Enough for any realistic file given run merging, but a pathologically fragmented attribute is rejected instead of truncated.
 8. **`$MFT` growth ends where record 0 runs out of mapping pairs.** The table and its bitmap both grow, but every chunk that lands away from the previous extent costs one mapping pair inside MFT record 0, and that record is 1 KB with no `$ATTRIBUTE_LIST` to spill into. Chunks of 256 clusters buy 1024 records per pair, so this is far away on a volume with contiguous free space: measured on a fragmented Windows volume with no free record left, growth continued for 6344 more files and stopped at 143 872 records with 156 runs, returning `EFI_VOLUME_FULL` with nothing modified. On a fresh volume the same test placed 30 000 files in 31 runs.

@@ -31,6 +31,7 @@
 #include "Panel.h"
 #include "PanelOps.h"
 #include "Checksum.h"
+#include "Console.h"
 #include "Sync.h"
 #include "Config.h"
 
@@ -646,6 +647,70 @@ static VOID StRunVolumeChecks(IN CONST CHAR16* Fixture)
           "volume tools: extended filesystem information");
 }
 
+/*
+ * The Ctrl+O console, as far as it can be driven without a keyboard: splitting
+ * a typed line into words and turning a typed path into a full one. The
+ * commands themselves are the same calls the panels make and are covered where
+ * those are.
+ */
+static VOID StRunConsoleChecks(IN CONST CHAR16* Fixture)
+{
+  CHAR16 line[CONSOLE_LINE_CHARS];
+  CHAR16* args[CONSOLE_MAX_ARGS];
+  CHAR16 resolved[MAX_PATH_LEN];
+  CHAR16 expected[MAX_PATH_LEN];
+  CHAR16 volume[MAX_PATH_LEN];
+  UINTN colon = 0;
+  UINTN count;
+
+  StrCpyS(line, ARRAY_SIZE(line), L"copy a.txt b.txt");
+  count = ConsoleSplitArgs(line, args, ARRAY_SIZE(args));
+  StCheck(count == 3 && StrCmp(args[0], L"copy") == 0 &&
+          StrCmp(args[1], L"a.txt") == 0 && StrCmp(args[2], L"b.txt") == 0,
+          "console: a plain line splits into its words");
+
+  StrCpyS(line, ARRAY_SIZE(line), L"  type \t \"my file.txt\"  ");
+  count = ConsoleSplitArgs(line, args, ARRAY_SIZE(args));
+  StCheck(count == 2 && StrCmp(args[0], L"type") == 0 &&
+          StrCmp(args[1], L"my file.txt") == 0,
+          "console: quotes hold a name with spaces together");
+
+  StrCpyS(line, ARRAY_SIZE(line), L"run app.efi -a -b -c");
+  count = ConsoleSplitArgs(line, args, ARRAY_SIZE(args));
+  StCheck(count == 5 && StrCmp(args[4], L"-c") == 0,
+          "console: arguments after the command are kept in order");
+
+  StrCpyS(line, ARRAY_SIZE(line), L"   ");
+  StCheck(ConsoleSplitArgs(line, args, ARRAY_SIZE(args)) == 0,
+          "console: a line of nothing but spaces is no command at all");
+
+  // A path already naming a volume is taken as it stands.
+  StCheck(ConsoleResolvePath(Fixture, L"fs0:\\EFI\\Boot", resolved, ARRAY_SIZE(resolved)) &&
+          StrCmp(resolved, L"fs0:\\EFI\\Boot") == 0,
+          "console: an absolute path passes through unchanged");
+
+  // A relative one hangs off the working directory.
+  FsCombinePath(expected, Fixture, L"top.tag");
+  StCheck(ConsoleResolvePath(Fixture, L"top.tag", resolved, ARRAY_SIZE(resolved)) &&
+          StrCmp(resolved, expected) == 0,
+          "console: a bare name joins the working directory");
+
+  // A leading backslash keeps the volume and drops the rest.
+  while (Fixture[colon] != L'\0' && Fixture[colon] != L':') colon++;
+  CopyMem(volume, Fixture, (colon + 1) * sizeof(CHAR16));
+  volume[colon + 1] = L'\0';
+  StrCpyS(expected, ARRAY_SIZE(expected), volume);
+  StrCatS(expected, ARRAY_SIZE(expected), L"\\Windows");
+  StCheck(ConsoleResolvePath(Fixture, L"\\Windows", resolved, ARRAY_SIZE(resolved)) &&
+          StrCmp(resolved, expected) == 0,
+          "console: a leading backslash means this volume's root");
+
+  StCheck(!ConsoleResolvePath(Fixture, L"name", resolved, 4),
+          "console: a result that would not fit is refused, not truncated");
+  StCheck(!ConsoleResolvePath(Fixture, L"", resolved, ARRAY_SIZE(resolved)),
+          "console: an empty path is refused");
+}
+
 static VOID StRunParseChecks(VOID)
 {
   EFI_TIME t;
@@ -686,6 +751,7 @@ BOOLEAN EcSelfTestMaybeRun(IN EFI_HANDLE ImageHandle)
     StRunChecksumChecks(fixture);
     StRunSyncChecks(fixture);
     StRunVolumeChecks(fixture);
+    StRunConsoleChecks(fixture);
   }
   StRunParseChecks();
   StRunFindChecks();
